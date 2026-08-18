@@ -1,45 +1,42 @@
 #pragma once
 
-#include <tuple> // std::tuple
-
-#include <lockdep/types.hpp>
-
-#include <bits/bitmask.hpp>
+#include <ustl/util/tuple.hpp>
+#include <ustl/util/enum_bits.hpp>
 
 namespace lockdep {
-    enum class LockFlags {
+    enum class ValidationControl {
         None,
 
-        IrqSafe = 0_bit,
+        IrqSafe = (1 << 0),
 
-        Nestable = 1_bit,
+        Nestable = (1 << 1),
 
-        MultiAcquire = 2_bit,
+        MultiAcquire = (1 << 2),
 
-        Leaf = 3_bit,
+        Leaf = (1 << 3),
 
-        SingletonLock = 4_bit,
+        ReportingDisabled = (1 << 4),
 
-        ReAcquireFatal = 5_bit,
+        SingletonLock = (1 << 5),
 
-        ActiveListDisabled = 6_bit,
+        ReAcquireFatal = (1 << 6),
 
-        TrackingDisabled = 7_bit,
+        ActiveListDisabled = (1 << 7),
 
-        ReportingDisabled = 8_bit,
+        TrackingDisabled = (1 << 8),
     };
-    BITS_IMPL_BITMASK(LockFlags);
+    USTL_ENABLE_ENUM_BITMASK(ValidationControl);
 
-    template <typename Lock, LockFlags Control>
+    template <typename Lock, ValidationControl Control>
     struct LockTraitsImpl {
-        static auto constexpr CONTROL = Control;
+        static auto constexpr kControl = Control;
     };
 
     template <typename Lock>
     struct MakeLockTraits {
         using ArgsTuple = decltype(lock_dep_extract_traits_helper(static_cast<Lock *>(nullptr)));
 
-        using Type = LockTraitsImpl<Lock, std::tuple_element_t<0, ArgsTuple>::VALUE>;
+        using Type = LockTraitsImpl<Lock, ustl::TupleElementT<ArgsTuple, 0>::VALUE>;
     }; 
 
     template <typename Lock>
@@ -49,6 +46,6 @@ namespace lockdep {
 
 /// Using function rather than class by pass namespace issues 
 /// brought by template class instanization.
-#define LOCK_DEP_TRAITS(LOCK_TYPE, LOCK_FLAGS) \
+#define LOCK_DEP_TRAITS(LOCK_TYPE, VALIDATION_CONTROL)  \
     constexpr auto lock_dep_extract_traits_helper(LOCK_TYPE *) \
-        -> std::integral_constant<lockdep::LockFlags, LOCK_FLAGS>;
+        -> ustl::Tuple<ustl::traits::IntegralConstant<lockdep::ValidationControl, VALIDATION_CONTROL>>;

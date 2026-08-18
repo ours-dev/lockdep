@@ -3,9 +3,7 @@
 #ifndef LOCKDEP_GUARD_HPP
 #define LOCKDEP_GUARD_HPP 1
 
-#include <tuple>
-
-#include <bits/bitmask.hpp>
+#include <utility>
 
 namespace lockdep {
     /// The RAII object to help us easier to use custom lock features.
@@ -16,8 +14,8 @@ namespace lockdep {
         using Lock = LockType;
 
         Guard(Lock &lock)
-            : m_lock(lock)
-            , m_states() { 
+            : lock_(lock)
+            , states_() { 
             this->guard();
         }
 
@@ -26,43 +24,35 @@ namespace lockdep {
         }
 
         auto unlock() -> void {
-            if (!std::get<0>(m_states)) {
-                m_lock.release();
-                std::get<0>(m_states) = true;
+            if (!std::get<0>(states_)) {
+                lock_.release();
+                std::get<0>(states_) = true;
             }
         }
 
         auto unguard() -> void {
-            std::get<0>(m_states) = true;
+            std::get<0>(states_) = true;
         }
       private:
-        Guard(Self &&) = delete;
-        Guard(Self const &) = delete;
-        auto operator=(Self &&) -> Self & = delete;
-        auto operator=(Self const &) -> Self & = delete;
+        USTL_NO_MOVEABLE_AND_COPYABLE(Guard);
 
         auto guard() -> void {
-            std::get<0>(m_states) = false;
-            m_lock.acquire();
+            std::get<0>(states_) = false;
+            lock_.acquire();
         }
 
-        Lock &m_lock;
-        std::tuple<bool, Options...> m_states; // unlocked, options...
+        Lock &lock_;
+        std::tuple<bool, Options...> states_; // unlocked, options...
     };
 
     template <>
     class Guard<void> {
-        using Self = Guard;
       public:
         Guard(...) {}
+        ~Guard() {}
 
         auto unlock() -> void {}
         auto unguard() -> void {}
-      private:
-        Guard(Self &&) = delete;
-        Guard(Self const &) = delete;
-        auto operator=(Self &&) -> Self & = delete;
-        auto operator=(Self const &) -> Self & = delete;
     };
 
     template <typename LockType, typename... Option>

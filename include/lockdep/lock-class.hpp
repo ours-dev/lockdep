@@ -1,52 +1,46 @@
-/// SPDX-License-Identifier: MIT
-/// Copyright (c) 2026 ours Developers
+#pragma once
 
-#ifndef LOCKDEP_LOCK_CLASS_HPP
-#define LOCKDEP_LOCK_CLASS_HPP 1
-
-#include <lockdep/types.hpp>
-#include <lockdep/lock-traits.hpp>
-#include <lockdep/loop-detector.h>
-
-#include <ustl/collections/intrusive/list.hpp>
+#include "types.hpp"
+#include "config.hpp"
+#include "lock-traits.hpp"
+#include "lock-class-state.hpp"
 
 namespace lockdep {
-    class LockClass {
-        using Self = LockClass;
+    template <typename Class, typename Lock, usize Index, ValidationControl Control>
+    class LockClass;
+
+namespace priv {
+    template <bool Enabled, typename Class, typename Lock, usize Index, ValidationControl Control>
+    class LockClassStateStorage;
+
+    template <typename Class, typename Lock, usize Index, ValidationControl Control>
+    class LockClassStateStorage<true, Class, Lock, Index, Control> {
+        using Self = LockClassStateStorage;
       public:
-        using Id = LockClassId;
-        using Flags = LockFlags;
-
-        static auto get(Id id) -> Self * { return const_cast<Self *>(id); }
-
-        LockClass(Flags flags)
-            : m_flags(flags), m_validator_state(), m_environment_hook() 
-        {}
-
-        auto id() const -> Id { return this; }
-
-        auto is_leaf() const -> bool { return !!(m_flags & Flags::Leaf); }
-        auto is_nestable() const -> bool { return !!(m_flags & Flags::Nestable); }
-        auto is_multi_acquire() const -> bool { return !!(m_flags & Flags::MultiAcquire); }
-        auto is_tracking_disabled() const -> bool { return !!(m_flags & Flags::TrackingDisabled); }
-        auto is_reporting_disabled() const -> bool { return !!(m_flags & Flags::ReportingDisabled); }
-
-        static auto add_dependency(Id prev, Id next) -> LockResult;
+        static auto id() -> LockClassId;
       private:
-        LockClass(Self const &) = delete;
-        auto operator=(Self const &) -> Self & = delete;
-        LockClass(Self &&) = delete;
-        auto operator=(Self &&) -> Self & = delete;
+        using State = IfLockValidationEnabled<ValidatorLockClassState, MetadataLockClassState> ;
+        static inline State g_lock_class_state;
+    };
 
-        Flags m_flags;
-        priv::ValidatorState m_validator_state;
-
-        ustl::collections::intrusive::ListMemberHook<> m_environment_hook;
-        USTL_DECLARE_HOOK_OPTION(Self, m_environment_hook, EnvironmentHookOption);
+    template <typename Class, typename Lock, usize Index, ValidationControl Control>
+    class LockClassStateStorage<false, Class, Lock, Index, Control> {
       public:
-        USTL_DECLARE_LIST(Self, EnvironmentList, EnvironmentHookOption);
-    }; // class LockClass
+        static auto id() -> LockClassId { return nullptr; }
+    };
+
+} // namespace lockdep::priv
+
+    template <typename Class, typename Lock, usize Index, ValidationControl Control>
+    class LockClass
+        : public priv::LockClassStateStorage<kLockMetadataAvailable, Class, Lock, Index, Control> 
+    {};
+
+    template <typename Lock_>
+    class Lock {
+        using Self = Lock;
+      public:
+      private:
+    };
 
 } // namespace lockdep
-
-#endif // #ifndef LOCKDEP_LOCK_CLASS_HPP

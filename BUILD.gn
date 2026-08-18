@@ -1,0 +1,23 @@
+# Copyright 2026 The Ours Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/cpp/cpp_interface.gni")
+
+# The lock-state API is currently header-only.  Keep its build target aligned
+# with that contract until runtime validation is implemented and has sources
+# that need linking.
+cpp_interface("lockdep") {
+  public = [
+    "include/lockdep/config.hpp",
+    "include/lockdep/guard.hpp",
+    "include/lockdep/lock-class-state.hpp",
+    "include/lockdep/lock-class.hpp",
+    "include/lockdep/lock-context.hpp",
+    "include/lockdep/lock-traits.hpp",
+    "include/lockdep/state-saver.hpp",
+    "include/lockdep/types.hpp",
+  ]
+
+  public_deps = [ "//system/lib/ustl:headers" ]
+}
