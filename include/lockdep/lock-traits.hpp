@@ -1,11 +1,16 @@
-#pragma once
+/// SPDX-License-Identifier: MIT
+/// Copyright (c) 2026 ours Developers
+#ifndef LOCKDEP_LOCK_TRAITS_HPP
+#define LOCKDEP_LOCK_TRAITS_HPP 1
 
-#include <ustl/util/tuple.hpp>
+#include <lockdep/types.hpp>
+
+#include <ustl/traits/integral_constant.hpp>
 #include <ustl/util/enum_bits.hpp>
 
 namespace lockdep {
     enum class ValidationControl {
-        None,
+        None = 0,
 
         IrqSafe = (1 << 0),
 
@@ -29,23 +34,48 @@ namespace lockdep {
 
     template <typename Lock, ValidationControl Control>
     struct LockTraitsImpl {
+        using LockType = Lock;
+
         static auto constexpr kControl = Control;
+
+        static auto constexpr has(ValidationControl control) -> bool {
+            return (kControl & control) != ValidationControl::None;
+        }
     };
 
+} // namespace lockdep
+
+/// Fallback for lock types that never declared traits.  It has to be visible
+/// before `MakeLockTraits` is defined so ordinary lookup finds it at template
+/// definition time, while ADL still picks up the per-lock overloads that
+/// `LOCK_DEP_TRAITS` declares next to each lock type.
+///
+/// Without it a lock with no `LOCK_DEP_TRAITS` is a hard error rather than a
+/// lock with default traits.
+constexpr auto lock_dep_extract_traits_helper(void const volatile *)
+    -> ustl::traits::IntConstant<lockdep::ValidationControl::None>;
+
+namespace lockdep {
     template <typename Lock>
     struct MakeLockTraits {
-        using ArgsTuple = decltype(lock_dep_extract_traits_helper(static_cast<Lock *>(nullptr)));
+        using Constant = decltype(lock_dep_extract_traits_helper(static_cast<Lock *>(nullptr)));
 
-        using Type = LockTraitsImpl<Lock, ustl::TupleElementT<ArgsTuple, 0>::VALUE>;
-    }; 
+        using Type = LockTraitsImpl<Lock, Constant::value>;
+    };
 
     template <typename Lock>
     using LockTraits = typename MakeLockTraits<Lock>::Type;
 
+    template <typename Lock>
+    constexpr auto kLockControlOf = LockTraits<Lock>::kControl;
+
 } // namespace lockdep
 
-/// Using function rather than class by pass namespace issues 
-/// brought by template class instanization.
-#define LOCK_DEP_TRAITS(LOCK_TYPE, VALIDATION_CONTROL)  \
-    constexpr auto lock_dep_extract_traits_helper(LOCK_TYPE *) \
-        -> ustl::Tuple<ustl::traits::IntegralConstant<lockdep::ValidationControl, VALIDATION_CONTROL>>;
+/// Using a function rather than a class to bypass the namespace issues brought
+/// by template class instantiation: the declaration can sit right next to the
+/// lock type and still be found through ADL from inside `lockdep`.
+#define LOCK_DEP_TRAITS(LOCK_TYPE, VALIDATION_CONTROL)                                             \
+    constexpr auto lock_dep_extract_traits_helper(LOCK_TYPE *)                                     \
+        -> ustl::traits::IntConstant<VALIDATION_CONTROL>;
+
+#endif // #ifndef LOCKDEP_LOCK_TRAITS_HPP

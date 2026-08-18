@@ -4,9 +4,12 @@
 
 import("//build/cpp/cpp_interface.gni")
 
-# The lock-state API is currently header-only.  Keep its build target aligned
-# with that contract until runtime validation is implemented and has sources
-# that need linking.
+# lockdep is header-only.  `LockContext` is small enough to inline, and the
+# lock class state has to be an inline variable anyway so every translation
+# unit agrees on the address that identifies a class.
+#
+# The dependency-graph walk in ValidatorLockClassState is the first thing that
+# will need a source file; add a compiled target when it lands.
 cpp_interface("lockdep") {
   public = [
     "include/lockdep/config.hpp",
