@@ -73,12 +73,33 @@ Two functions, referenced only when validation is enabled, so a build with
 ## Tests
 
 ```sh
-./tests/run-smoke.sh
+./tests/run-smoke.sh      # logic, at all three feature levels
+./tests/run-threaded.sh   # real threads, plain and under the sanitizers
 ```
 
-Builds and runs `tests/smoke.cpp` at all three feature levels with
-`-Wall -Wextra -Werror`. It needs ustl's headers; the script looks for them in
-the surrounding ours checkout, or set `USTL_INCLUDE`.
+Both need ustl's headers; the scripts look for them in the surrounding ours
+checkout, or set `USTL_INCLUDE`.
+
+Lock validation turns out to be well suited to a host test, because everything
+lockdep concludes is a property of a graph, and a graph does not care whether
+the locks that built it were spinlocks or `std::mutex`. `tests/smoke.cpp` covers
+that logic at every feature level with `-Wall -Wextra -Werror`, using fake locks:
+that a consistent order stays clean, that an inversion is caught at acquire time,
+that a three-node cycle is invisible to the acquire path but found by the
+detector, that repeated passes agree, and that a guard costs nothing extra when
+validation is compiled out.
+
+`tests/threaded.cpp` drives it the way a kernel does — one `LockContext` per
+thread, real locks, several threads recording into the shared graph at once —
+and checks that two threads taking the same pair of locks in opposite orders are
+reported even though the run never actually deadlocks. Its ThreadSanitizer
+variant is what says the lock-free registry and the dependency set are safe to
+record into from several CPUs.
+
+What no host test can cover is the arch integration: interrupt and preemption
+state savers have no userspace meaning, so `Guard<SpinLock, IrqSave>` is only
+checked here for saver *ordering* against fakes, never against real hardware
+state.
 
 ## Known limits
 
