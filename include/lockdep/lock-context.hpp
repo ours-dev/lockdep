@@ -4,6 +4,8 @@
 #define LOCKDEP_LOCK_CONTEXT_HPP 1
 
 #include <lockdep/config.hpp>
+#include <lockdep/lock-class-state.hpp>
+#include <lockdep/report.hpp>
 #include <lockdep/types.hpp>
 
 #include <ustl/collections/intrusive/slist.hpp>
@@ -68,11 +70,68 @@ namespace priv {
       private:
         USTL_NOCOPYABLE(LockContext);
 
-        /// TODO: walk the dependency graph reachable from `entry.id()` against
-        /// the classes already in `m_acquired_locks` and report a cycle.  The
-        /// graph and its detector live in `ValidatorLockClassState`.
+        /// Records what this acquisition says about lock ordering, and reports
+        /// the violations that are cheap to see from here.
+        ///
+        /// Runs with the lock not yet taken and the entry not yet in the list,
+        /// so `m_acquired_locks` is exactly the set of locks already held.
+        ///
+        /// Deliberately O(held locks): it records edges and checks for a direct
+        /// back edge, and leaves the full graph walk to
+        /// `detect_lock_order_cycles()`.  A transitive cycle costs nothing here
+        /// and is found by the next detector pass.
         auto validate_acquire(AcquiredLockEntry const &entry) -> void {
-            (void)entry;
+            auto *acquiring = ValidatorLockClassState::from_id(entry.id());
+            if (acquiring == nullptr || acquiring->tracking_disabled()) {
+                return;
+            }
+            acquiring->ensure_registered();
+
+            for (auto const &held_entry : m_acquired_locks) {
+                auto *held = ValidatorLockClassState::from_id(held_entry.id());
+                if (held == nullptr || held->tracking_disabled()) {
+                    continue;
+                }
+
+                if (held == acquiring) {
+                    if (!acquiring->nestable()) {
+                        report(Violation::ReAcquire, acquiring, acquiring);
+                    }
+                    continue;
+                }
+
+                // A leaf lock is the last one a context may take.
+                if (held->has(ValidationControl::Leaf)) {
+                    report(Violation::LeafAcquire, acquiring, held);
+                }
+
+                // The reverse order has been seen before, so the two orders can
+                // meet head on.  Worth reporting here rather than waiting for a
+                // detector pass, because the acquiring context is still on the
+                // stack that produced it.
+                if (acquiring->has_dependency(held)) {
+                    report(Violation::CircularDependency, acquiring, held);
+                }
+
+                held->ensure_registered();
+                if (!held->add_dependency(acquiring)) {
+                    report(Violation::DependencySetFull, acquiring, held);
+                }
+            }
+        }
+
+        static auto report(Violation violation, ValidatorLockClassState *acquiring,
+                           ValidatorLockClassState *held) -> void {
+            if (acquiring->has(ValidationControl::ReportingDisabled) ||
+                held->has(ValidationControl::ReportingDisabled)) {
+                return;
+            }
+            report_violation(ViolationReport{
+                violation,
+                acquiring->id(),
+                held->id(),
+                acquiring->has(ValidationControl::ReAcquireFatal),
+            });
         }
 
         AcquiredLockEntry::List m_acquired_locks;

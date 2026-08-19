@@ -3,6 +3,7 @@
 #ifndef LOCKDEP_CONFIG_HPP
 #define LOCKDEP_CONFIG_HPP 1
 
+#include <cstddef>
 #include <type_traits>
 
 /// The build system owns the feature level.  `config("lockdep")` in
@@ -18,6 +19,16 @@
 #   define LOCKDEP_FEATURE_LEVEL LOCK_DEP_ENABLED_FEATURE_LEVEL
 #else
 #   define LOCKDEP_FEATURE_LEVEL 0
+#endif
+
+/// How many distinct classes one lock class may be recorded as preceding.
+///
+/// The dependency set is a fixed array so that recording an edge never
+/// allocates -- edges are recorded from inside the acquire path, where
+/// allocating is not an option.  Overflowing it costs completeness, not
+/// soundness: the overflowing edge is reported and dropped.
+#ifndef LOCKDEP_MAX_DEPENDENCIES
+#   define LOCKDEP_MAX_DEPENDENCIES 32
 #endif
 
 namespace lockdep {
@@ -51,6 +62,9 @@ namespace lockdep {
 
     template <typename T, typename U>
     using IfLockMetadataAvailable = std::conditional_t<kLockMetadataAvailable, T, U>;
+
+    constexpr std::size_t kMaxDependencies = LOCKDEP_MAX_DEPENDENCIES;
+    static_assert(kMaxDependencies > 0, "a lock class must be able to record at least one edge");
 
 } // namespace lockdep
 
