@@ -1,0 +1,411 @@
+# lockdep interface
+
+This is the public interface lockdep should expose, modeled on Zircon's
+lockdep (`fuchsia/src/lib/lockdep/include/lockdep/`, kernel glue in
+`fuchsia/zircon/kernel/lib/lockdep/lock_dep.cc`). The current headers predate
+it and are to be reshaped to match.
+
+Two choices below were put to the maintainer and settled rather than inferred:
+a lock's class is named by a tag type, not by Zircon's `__LINE__` macro; and
+`Guard` accepts only `lockdep::Lock<T>`, with no transitional overload for raw
+locks.
+
+Where the design keeps Zircon's shape the Zircon file is cited so the two can
+be compared. Where it departs, the reason is given — usually one of this
+repository's own rules: composition over inheritance, no macros around what the
+language can spell, `UPPER_CASE` constants, `lower_case` functions, underscore
+file names, and `std::` facilities over ustl wrappers.
+
+## What the current interface gets wrong
+
+1. **A lock has no class of its own.** `Guard{lock}` takes a raw `SpinLock&`,
+   so the class can only be derived from the lock *type*. Every `SpinLock` in
+   the kernel is then one class, and taking the pi lock and then a run queue
+   lock — two different spinlocks, a perfectly ordinary nesting — is reported
+   as re-acquiring the same lock. Turning validation on would bury real reports
+   under that noise. Zircon gives every lock *declaration* its own class
+   (`LOCK_DEP_INSTRUMENT` in `lock_traits.h`, keyed on the containing type and
+   `__LINE__`); ours has to as well.
+2. **State savers only half describe a lock.** A saver brackets the
+   acquisition but cannot own it, so there is no place for try-lock, for
+   release arguments, or for the one ordering constraint that matters: an
+   irq-safe lock must disable interrupts *before* lockdep records the
+   acquisition, or an interrupt landing in between sees the lock as already
+   held. Zircon's `LockPolicy` (`lock_policy.h`) owns all four steps; savers
+   are a strict subset of it.
+3. **`ScopedGuard` duplicates `Guard`** and cannot carry an option. Zircon has
+   no such type: different classes are nested `Guard`s, and several locks of
+   one class go through `GuardMultiple`, which orders them by address.
+4. **One context per thread is not enough.** A lock taken from interrupt
+   context must not land on the interrupted thread's held list. Zircon selects
+   the list by the lock's flags (`SystemGetThreadLockState(LockFlags)`: per-CPU
+   for irq-safe locks, per-thread otherwise).
+
+## Headers
+
+| Header | Zircon counterpart | Holds |
+| --- | --- | --- |
+| `lockdep/config.hpp` | `common.h` | feature level, `LockClassId`, `LockResult`, limits |
+| `lockdep/lock_flags.hpp` | `lock_traits.h` | `LockFlags`, `lockdep_traits` lookup |
+| `lockdep/lock_policy.hpp` | `lock_policy.h` | option tags, the `LockPolicy` concept, `lockdep_policy` lookup |
+| `lockdep/lock_class.hpp` | `lock_class.h` | `class_id<Tag>()`, `Lock<T>`, `SingletonLock` |
+| `lockdep/guard.hpp` | `guard.h` | `Guard`, `NullGuard`, `assert_held` |
+| `lockdep/guard_multiple.hpp` | `guard_multiple.h` | `GuardMultiple` |
+| `lockdep/thread_lock_state.hpp` | `thread_lock_state.h` | `AcquiredLockEntry`, `ThreadLockState`, `assert_no_locks_held` |
+| `lockdep/lock_class_state.hpp` | `lock_class_state.h` | the graph node and `loop_detection_pass()` |
+| `lockdep/runtime_api.hpp` | `runtime_api.h` | what the environment must define |
+| `lockdep/lockdep.hpp` | `lockdep.h` | umbrella |
+
+`LockContext` becomes `ThreadLockState`: it is exactly Zircon's type, and the
+old name hid that one instance can belong to a CPU rather than a thread.
+
+## Configuration — `config.hpp`
+
+```cpp
+enum class FeatureLevel : u8 { Disabled = 0, MetadataOnly = 1, Validation = 2 };
+
+constexpr auto ENABLED_FEATURE_LEVEL = static_cast<FeatureLevel>(LOCK_DEP_ENABLED_FEATURE_LEVEL);
+constexpr auto LOCK_METADATA_AVAILABLE = ...;
+constexpr auto LOCK_VALIDATION_ENABLED = ...;
+constexpr auto MAX_LOCK_DEPENDENCIES = ...;   // from LOCK_DEP_MAX_DEPENDENCIES
+
+using LockClassId = LockClassState const *;
+constexpr LockClassId INVALID_LOCK_CLASS_ID = nullptr;
+
+enum class LockResult : u8 {
+    Success,
+    AlreadyAcquired,     // same class twice, class is not nestable
+    OutOfOrder,          // the reverse edge is already in the graph
+    InvalidNesting,      // nestable class taken with a non-increasing order
+    InvalidIrqSafety,    // irq-unsafe lock taken while holding an irq-safe one
+    Reentrance,          // the very same lock instance taken twice
+    ShouldNotHold,       // assert_no_locks_held() with locks held
+    AcquireAfterLeaf,
+    MaxLockDependencies, // non-fatal: the dependency set is full
+};
+auto to_string(LockResult) -> char const *;
+```
+
+Same as Zircon except naming. Zircon's `DependencyExists` is an internal
+return value of the dependency set and stays internal here.
+
+## Lock flags — `lock_flags.hpp`
+
+```cpp
+enum class LockFlags : u16 {
+    None = 0,
+    IrqSafe            = 1 << 0,
+    Nestable           = 1 << 1,
+    MultiAcquire       = 1 << 2,
+    Leaf               = 1 << 3,
+    ReportingDisabled  = 1 << 4,
+    SingletonLock      = 1 << 5,
+    ReAcquireFatal     = 1 << 6,
+    ActiveListDisabled = 1 << 7,
+    TrackingDisabled   = 1 << 8,
+};
+```
+
+A lock *type* declares its default flags next to its own definition, with a
+function declaration that ADL finds from inside lockdep:
+
+```cpp
+namespace ours::sync {
+    class SpinLock { ... };
+    auto lockdep_traits(SpinLock *) -> lockdep::Traits<lockdep::LockFlags::IrqSafe>;
+}
+```
+
+Zircon wraps this in `LOCK_DEP_TRAITS()`. The macro hides nothing but a
+declaration the language already spells, so here it is written out. A type with
+no declaration gets `LockFlags::None`, as in Zircon.
+
+`Traits<Flags>` rejects `MultiAcquire | Nestable` and
+`MultiAcquire | ReAcquireFatal` at compile time, like Zircon's
+`DefaultLockFlags`.
+
+## Lock policies — `lock_policy.hpp`
+
+A policy says how to take and drop one lock type under one option, and what
+state the guard must keep in between. It replaces `LOCKDEP_STATE_SAVER`.
+
+```cpp
+template <typename P, typename LockType>
+concept LockPolicy = requires(LockType &lock, typename P::State &state) {
+    typename P::State;
+    typename P::ValidationGuard;                             // RAII around every held-list update
+    { P::pre_validate(lock, state) } -> std::same_as<void>;  // before lockdep records the acquisition
+    { P::acquire(lock, state) }      -> std::same_as<bool>;  // false: try-lock failed
+    { P::release(lock, state) }      -> std::same_as<void>;
+};
+// Optional: static auto assert_held(LockType const &) -> void;
+```
+
+`ValidationGuard` is constructed around each update of the held list. For a
+lock whose policy already runs with interrupts off (a spinlock under
+`IrqSave`) it is `NullValidationGuard`. For one that does not — a mutex — it
+must disable interrupts for the few instructions the list is being relinked,
+or an interrupt that takes an irq-safe lock can observe the list half-updated.
+That is what Zircon's `LockValidationGuard`
+(`kernel/include/kernel/lock_validation_guard.h`) does for `Mutex` and
+`BrwLock`.
+
+The mapping from (lock type, option) to a policy is again a declaration next to
+the lock type:
+
+```cpp
+namespace ours::sync {
+    auto lockdep_policy(SpinLock *, void *)            -> NoIrqSavePolicy;   // Guard<SpinLock>
+    auto lockdep_policy(SpinLock *, lockdep::IrqSave *) -> IrqSavePolicy;    // Guard<SpinLock, IrqSave>
+}
+```
+
+Option tags are plain empty types owned by lockdep — `IrqSave`, `NoIrqSave`,
+`PreemptDisable`, `IrqSaveAndPreemptDisable`, `TryLock` — so a look-alike
+declared elsewhere cannot be passed by accident: it would find no policy and
+fail to compile.
+
+**No default policy**, as in Zircon's kernel build: `DefaultLockPolicy` is
+compiled in only when `LOCK_DEP_ENABLE_DEFAULT_LOCK_POLICY` is set, because a
+default cannot know whether the environment needs a validation guard. A lock
+type with no policy is a compile error carrying the concept's diagnostic.
+
+## Lock classes — `lock_class.hpp`
+
+A class is named by a tag type. `class_id<Tag, Flags>()` returns the address of
+a static state object that exists once per instantiation, exactly like
+Zircon's `LockClassStateStorage::lock_class_state_`:
+
+```cpp
+template <typename Tag, LockFlags Flags = LockFlags::None>
+constexpr auto class_id() -> LockClassId;
+```
+
+A lock is the underlying lock **plus** its class id — composition, no base
+class:
+
+```cpp
+template <typename LockType>
+class Lock {
+  public:
+    template <typename... Args>
+    constexpr explicit Lock(LockClassId id, Args &&...args);
+
+    auto lock() -> LockType &;
+    auto lock() const -> LockType const &;
+    constexpr auto id() const -> LockClassId;   // INVALID_LOCK_CLASS_ID when metadata is off
+
+    Lock(Lock const &) = delete;
+    auto operator=(Lock const &) -> Lock & = delete;
+
+  private:
+    LockType m_lock;
+    [[no_unique_address]] ClassIdStorage m_id;  // empty when metadata is off
+};
+```
+
+Declaring a lock names its class at the declaration:
+
+```cpp
+class Thread {
+    lockdep::Lock<sync::SpinLock> m_pi_lock{lockdep::class_id<struct ThreadPiLock>()};
+    lockdep::Lock<sync::SpinLock> m_task_lock{lockdep::class_id<struct ThreadTaskLock>()};
+};
+```
+
+How this differs from Zircon, and why:
+
+- Zircon makes the class part of the lock's *type*,
+  `LockDep<Class, LockType, Index> : Lock<LockType>`, and needs the base class
+  to erase it again so `get_lock()` can return `Lock<SpinLock>*`. Carrying the
+  id as a member instead makes `Lock<SpinLock>` the one type from the start —
+  no inheritance, nothing to erase. Zircon stores the id in the lock anyway
+  (`AvailableState::id_`), so this costs nothing it did not already pay.
+- Zircon distinguishes two locks of one type in one class with `__LINE__`
+  inside `LOCK_DEP_INSTRUMENT`. A tag type does the same job in standard
+  syntax, and its name is what a report prints — `ThreadPiLock` reads better
+  than `Thread:142`.
+
+Global locks:
+
+```cpp
+template <typename Tag, typename LockType, LockFlags Flags = LockFlags::None>
+class SingletonLock {
+  public:
+    static auto get() -> Lock<LockType> &;
+};
+```
+
+This is Zircon's `SingletonLockDep` without the CRTP: the tag is a template
+argument rather than the derived type. Zircon's
+`LOCK_DEP_SINGLETON_LOCK_WRAPPER` (wrapping a C global) is left out until
+something needs it.
+
+## Guards — `guard.hpp`
+
+```cpp
+template <typename LockType, typename Option = void>
+class Guard {
+  public:
+    template <typename... StateArgs>
+    explicit Guard(Lock<LockType> &lock, StateArgs &&...);
+
+    // Nestable classes only: an explicit order among locks of the same class.
+    template <typename... StateArgs>
+    Guard(Lock<LockType> &lock, usize order, StateArgs &&...)
+        requires NESTABLE;
+
+    Guard(AdoptLock, Lock<LockType> &lock, Adoptable &&);
+
+    ~Guard();
+
+    auto release(auto &&...release_args) -> void;
+    auto call_unlocked(auto &&op, auto &&...release_args) -> void;
+    auto call_untracked(auto &&op) -> void;
+    auto take() -> Adoptable;
+
+    explicit operator bool() const;             // false after release or a failed try-lock
+    auto wraps_lock(LockType const &) const -> bool;
+    auto lock() const -> LockType const *;
+
+    Guard(Guard const &) = delete;
+    auto operator=(Guard const &) -> Guard & = delete;
+};
+
+template <typename LockType, typename Option = void>
+auto assert_held(Lock<LockType> const &) -> void;
+
+class NullGuard;   // same surface, does nothing
+```
+
+The acquire sequence is Zircon's `ValidateAndAcquire`, and its order is the
+point of the policy split:
+
+1. `policy::pre_validate` — e.g. disable interrupts;
+2. record the acquisition in `ThreadLockState` (validation happens here);
+3. `policy::acquire` — if it returns false, undo step 2.
+
+`release` does the reverse, un-recording **before** `policy::release`, for the
+reason Zircon documents on `Guard::Release`: releasing may re-enable
+interrupts, and an interrupt taking the same lock before the bookkeeping is
+cleared would be reported as re-entrance.
+
+Differences from Zircon: locks are passed by reference, since a guard of a null
+lock is never meaningful; the shared-mode specialisation, `AliasedLock` and
+`AssertOrderedLock` are left out until a reader-writer lock or type-erased
+nestable lock needs them.
+
+## Several locks of one class — `guard_multiple.hpp`
+
+```cpp
+template <usize N, typename LockType, typename Option = void>
+class GuardMultiple {
+  public:
+    explicit GuardMultiple(std::array<Lock<LockType> *, N> locks);  // all of one class
+    auto release() -> void;
+    explicit operator bool() const;
+};
+```
+
+Takes the locks in address order, so any two sites locking the same set agree
+on the order. Replaces `ScopedGuard`; locks of *different* classes are simply
+nested `Guard`s, whose order is exactly what lockdep is there to check.
+
+## Per-context state — `thread_lock_state.hpp`
+
+```cpp
+class AcquiredLockEntry {
+  public:
+    auto address() const -> void *;
+    auto id() const -> LockClassId;
+    auto order() const -> usize;
+  private:
+    void *m_address;
+    LockClassId m_id;
+    usize m_order;
+    ustl::collections::intrusive::ListMemberHook<> m_hook;   // member, not a base
+};
+
+class ThreadLockState {
+  public:
+    auto acquire(AcquiredLockEntry &) -> void;
+    auto release(AcquiredLockEntry &) -> void;
+    auto assert_no_locks_held() -> void;
+    auto last_result() const -> LockResult;     // for tests
+};
+
+auto assert_no_locks_held() -> void;
+```
+
+The checks inside `acquire` are Zircon's, in Zircon's order: leaf, same class
+(re-entrance / already acquired / invalid nesting), then for each new edge the
+irq-safety rule and the reverse-edge check. Only a *new* edge triggers loop
+detection. `ReportingDisabled` is a counter, and a report itself raises it so a
+report that takes a lock (a console lock, say) cannot recurse into lockdep —
+the hazard the current `report_violation` leaves open.
+
+The held list becomes doubly linked (Zircon uses
+`fbl::DoublyLinkedList`): out-of-order release is O(1) instead of a scan.
+
+## Graph — `lock_class_state.hpp`
+
+```cpp
+class LockClassState {
+  public:
+    static auto get(LockClassId) -> LockClassState *;
+    auto flags() const -> LockFlags;
+    auto name() const -> char const *;
+    // Validation only:
+    auto has_dependency(LockClassId) const -> bool;
+    auto add_dependency(LockClassId) -> LockResult;
+};
+
+auto loop_detection_pass() -> void;
+```
+
+One class, with the metadata and validator parts as members selected by the
+feature level, where Zircon chains `LockClassState` → `MetadataLockClassState`
+→ `ValidatorLockClassState` through inheritance.
+
+The dependency set moves from a linear array to Zircon's lock-free
+open-addressed hash set (`lock_dependency_set.h`), sized to a prime; lookups on
+the acquire path stop being linear in the fan-out. Loop detection stays
+Tarjan's, as now.
+
+## Environment — `runtime_api.hpp`
+
+Declared by lockdep, defined by the kernel; referenced only when validation is
+enabled.
+
+```cpp
+auto system_get_thread_lock_state(LockFlags flags) -> ThreadLockState *;
+auto system_init_thread_lock_state(ThreadLockState *) -> void;
+auto system_lock_validation_error(AcquiredLockEntry *bad, AcquiredLockEntry *conflicting,
+                                  ThreadLockState *, void *caller, LockResult) -> void;
+auto system_lock_validation_fatal(AcquiredLockEntry *bad, ThreadLockState *,
+                                  void *caller, LockResult) -> void;
+auto system_circular_lock_dependency_detected(LockClassState *root) -> void;
+auto system_trigger_loop_detection() -> void;
+```
+
+`system_get_thread_lock_state` receives the flags so the kernel can return the
+per-CPU state for irq-safe locks and the per-thread state otherwise, as
+Zircon's `lock_dep.cc` does. `system_trigger_loop_detection` only marks the
+graph dirty; a worker calls `loop_detection_pass()` — detection never runs on
+the acquire path.
+
+## What changes for the kernel
+
+- Lock members become `lockdep::Lock<T>` with a class tag. There is no raw-lock
+  overload of `Guard`: keeping one would keep the one-class-per-type noise.
+- `LOCKDEP_STATE_SAVER` declarations become `lockdep_policy` declarations with
+  policies modeled on Zircon's `kernel/include/kernel/spinlock.h`
+  (`NoIrqSavePolicy`, `IrqSavePolicy`, the try-lock variants).
+- `Thread` holds a `ThreadLockState`; each CPU's local data holds another.
+- `ScopedGuard` call sites become nested `Guard`s.
+
+## Layout
+
+Per this repository's library shape: `include/lockdep/`, `src/`, `test/`,
+`.gitignore`, `.clang-format`. Tests are built by GN rather than by the shell
+scripts currently in `tests/`.

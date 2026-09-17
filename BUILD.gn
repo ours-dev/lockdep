@@ -1,0 +1,27 @@
+# Copyright 2026 The Ours Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/cpp/cpp_interface.gni")
+
+# lockdep is header-only.  `LockContext` is small enough to inline, and the
+# lock class state has to be an inline variable anyway so every translation
+# unit agrees on the address that identifies a class.
+#
+# The dependency-graph walk in ValidatorLockClassState is the first thing that
+# will need a source file; add a compiled target when it lands.
+cpp_interface("lockdep") {
+  public = [
+    "include/lockdep/config.hpp",
+    "include/lockdep/guard.hpp",
+    "include/lockdep/lock_class_state.hpp",
+    "include/lockdep/lock_class.hpp",
+    "include/lockdep/lock_context.hpp",
+    "include/lockdep/lock_traits.hpp",
+    "include/lockdep/report.hpp",
+    "include/lockdep/state_saver.hpp",
+    "include/lockdep/types.hpp",
+  ]
+
+  public_deps = [ "//system/lib/ustl:headers" ]
+}
