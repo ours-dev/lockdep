@@ -1,5 +1,5 @@
 // Compile-and-run smoke test for the lockdep headers.
-// Built once per feature level; see run-smoke.sh.
+// Built once per feature level; see run_tests.py.
 
 #include <lockdep/config.hpp>
 #include <lockdep/guard.hpp>

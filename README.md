@@ -75,12 +75,14 @@ Two functions, referenced only when validation is enabled, so a build with
 ## Tests
 
 ```sh
-./tests/run-smoke.sh      # logic, at all three feature levels
-./tests/run-threaded.sh   # real threads, plain and under the sanitizers
+tests/run_tests.py                    # everything
+tests/run_tests.py --suite smoke      # logic, at all three feature levels
+tests/run_tests.py --suite threaded   # real threads, plain and under the sanitizers
 ```
 
-Both need ustl's headers; the scripts look for them in the surrounding ours
-checkout, or set `USTL_INCLUDE`.
+The headers lean on the ours tree -- the force-included prelude for `usize`,
+ustl, and the thread-safety macros in `system/public` -- so the script finds
+the ours checkout above this library, or takes one with `--ours`.
 
 Lock validation turns out to be well suited to a host test, because everything
 lockdep concludes is a property of a graph, and a graph does not care whether

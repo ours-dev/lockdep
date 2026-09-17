@@ -9,7 +9,7 @@
 // lists, concurrent edge recording, and the cycle walk.  What it cannot cover
 // is the arch integration -- interrupt state savers have no userspace meaning.
 //
-// Built only at the validation feature level; see run-threaded.sh.
+// Built only at the validation feature level; see run_tests.py.
 
 #include <lockdep/guard.hpp>
 #include <lockdep/lock_class.hpp>
