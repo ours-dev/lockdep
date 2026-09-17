@@ -14,12 +14,12 @@ cpp_interface("lockdep") {
   public = [
     "include/lockdep/config.hpp",
     "include/lockdep/guard.hpp",
-    "include/lockdep/lock-class-state.hpp",
-    "include/lockdep/lock-class.hpp",
-    "include/lockdep/lock-context.hpp",
-    "include/lockdep/lock-traits.hpp",
+    "include/lockdep/lock_class_state.hpp",
+    "include/lockdep/lock_class.hpp",
+    "include/lockdep/lock_context.hpp",
+    "include/lockdep/lock_traits.hpp",
     "include/lockdep/report.hpp",
-    "include/lockdep/state-saver.hpp",
+    "include/lockdep/state_saver.hpp",
     "include/lockdep/types.hpp",
   ]
 

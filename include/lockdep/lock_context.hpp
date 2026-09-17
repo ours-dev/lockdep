@@ -4,7 +4,7 @@
 #define LOCKDEP_LOCK_CONTEXT_HPP 1
 
 #include <lockdep/config.hpp>
-#include <lockdep/lock-class-state.hpp>
+#include <lockdep/lock_class_state.hpp>
 #include <lockdep/report.hpp>
 #include <lockdep/types.hpp>
 
@@ -21,8 +21,7 @@ namespace priv {
       public:
         AcquiredLockEntry() = default;
 
-        explicit AcquiredLockEntry(LockClassId id)
-            : m_id(id) {}
+        explicit AcquiredLockEntry(LockClassId id) : m_id(id) {}
 
         auto id() const -> LockClassId {
             return m_id;
@@ -31,7 +30,7 @@ namespace priv {
       private:
         USTL_NOCOPYABLE(AcquiredLockEntry);
 
-        LockClassId m_id{kInvalidLockClassId};
+        LockClassId m_id{INVALID_LOCK_CLASS_ID};
 
         ustl::collections::intrusive::SlistMemberHook<> m_hook;
         USTL_DECLARE_HOOK_OPTION(Self, m_hook, HookOption);
@@ -87,7 +86,7 @@ namespace priv {
             }
             acquiring->ensure_registered();
 
-            for (auto const &held_entry : m_acquired_locks) {
+            for (auto const &held_entry: m_acquired_locks) {
                 auto *held = ValidatorLockClassState::from_id(held_entry.id());
                 if (held == nullptr || held->tracking_disabled()) {
                     continue;
@@ -147,7 +146,7 @@ namespace priv {
         explicit NullAcquiredLockEntry(LockClassId) {}
 
         auto id() const -> LockClassId {
-            return kInvalidLockClassId;
+            return INVALID_LOCK_CLASS_ID;
         }
     };
 
@@ -155,24 +154,26 @@ namespace priv {
       public:
         auto acquire(NullAcquiredLockEntry &) -> void {}
         auto release(NullAcquiredLockEntry &) -> void {}
-        auto empty() const -> bool { return true; }
+        auto empty() const -> bool {
+            return true;
+        }
     };
 
-} // namespace lockdep::priv
+} // namespace priv
 
-    using AcquiredLockEntry =
-        IfLockValidationEnabled<priv::AcquiredLockEntry, priv::NullAcquiredLockEntry>;
+using AcquiredLockEntry =
+    IfLockValidationEnabled<priv::AcquiredLockEntry, priv::NullAcquiredLockEntry>;
 
-    using LockContext = IfLockValidationEnabled<priv::LockContext, priv::NullLockContext>;
+using LockContext = IfLockValidationEnabled<priv::LockContext, priv::NullLockContext>;
 
-    /// Returns the lock context of the currently running execution context, or
-    /// `nullptr` when there is none yet (early boot, before the scheduler).
-    ///
-    /// lockdep cannot know how the environment tracks the current context, so
-    /// the definition is supplied by the kernel.  It is only referenced when
-    /// validation is enabled, which is why a build with `lockdep_enable=false`
-    /// links without providing it.
-    auto current_lock_context() -> LockContext *;
+/// Returns the lock context of the currently running execution context, or
+/// `nullptr` when there is none yet (early boot, before the scheduler).
+///
+/// lockdep cannot know how the environment tracks the current context, so
+/// the definition is supplied by the kernel.  It is only referenced when
+/// validation is enabled, which is why a build with `lockdep_enable=false`
+/// links without providing it.
+auto current_lock_context() -> LockContext *;
 
 } // namespace lockdep
 

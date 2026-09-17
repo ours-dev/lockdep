@@ -3,142 +3,169 @@
 
 #include <lockdep/config.hpp>
 #include <lockdep/guard.hpp>
-#include <lockdep/lock-class-state.hpp>
-#include <lockdep/lock-class.hpp>
-#include <lockdep/lock-context.hpp>
-#include <lockdep/lock-traits.hpp>
+#include <lockdep/lock_class.hpp>
+#include <lockdep/lock_class_state.hpp>
+#include <lockdep/lock_context.hpp>
+#include <lockdep/lock_traits.hpp>
 #include <lockdep/report.hpp>
-#include <lockdep/state-saver.hpp>
+#include <lockdep/state_saver.hpp>
 #include <lockdep/types.hpp>
+
+#include <tuple>
 
 #include <cstdio>
 
 namespace fake {
 
-    // Stands in for arch::AutoInterruptDisabler / task::AutoPreemptDisabler.
-    inline int g_irq_depth = 0;
-    inline int g_preempt_depth = 0;
+// Stands in for arch::AutoInterruptDisabler / task::AutoPreemptDisabler.
+inline int g_irq_depth = 0;
+inline int g_preempt_depth = 0;
 
-    struct AutoInterruptDisabler {
-        AutoInterruptDisabler() { ++g_irq_depth; }
-        ~AutoInterruptDisabler() { --g_irq_depth; }
-    };
+struct AutoInterruptDisabler {
+    AutoInterruptDisabler() {
+        ++g_irq_depth;
+    }
+    ~AutoInterruptDisabler() {
+        --g_irq_depth;
+    }
+};
 
-    struct AutoPreemptDisabler {
-        AutoPreemptDisabler() { ++g_preempt_depth; }
-        ~AutoPreemptDisabler() { --g_preempt_depth; }
-    };
+struct AutoPreemptDisabler {
+    AutoPreemptDisabler() {
+        ++g_preempt_depth;
+    }
+    ~AutoPreemptDisabler() {
+        --g_preempt_depth;
+    }
+};
 
-    struct SpinLock {
-        auto acquire() -> void { held = true; }
-        auto release() -> void { held = false; }
-        bool held{false};
-    };
+struct SpinLock {
+    auto acquire() -> void {
+        held = true;
+    }
+    auto release() -> void {
+        held = false;
+    }
+    bool held{false};
+};
 
-    // A lock that declares neither traits nor state savers: it must still work
-    // through the fallbacks.
-    struct BareLock {
-        auto acquire() -> void {}
-        auto release() -> void {}
-    };
+// A lock that declares neither traits nor state savers: it must still work
+// through the fallbacks.
+struct BareLock {
+    auto acquire() -> void {}
+    auto release() -> void {}
+};
 
-    LOCK_DEP_TRAITS(SpinLock, lockdep::ValidationControl::IrqSafe);
-    LOCKDEP_STATE_SAVER(SpinLock, lockdep::SavedStateOption::IrqSave, AutoInterruptDisabler);
-    LOCKDEP_STATE_SAVER(SpinLock, lockdep::SavedStateOption::PreemptDisable, AutoPreemptDisabler);
+LOCK_DEP_TRAITS(SpinLock, lockdep::ValidationControl::IrqSafe);
+LOCKDEP_STATE_SAVER(SpinLock, lockdep::SavedStateOption::IrqSave, AutoInterruptDisabler);
+LOCKDEP_STATE_SAVER(SpinLock, lockdep::SavedStateOption::PreemptDisable, AutoPreemptDisabler);
+// The combined option names its own saver, the way spin_lock.hpp does it.
+auto lockdep_get_state_saver(SpinLock *, lockdep::IrqSaveAndPreemptDisable *)
+    -> std::tuple<AutoInterruptDisabler, AutoPreemptDisabler>;
 
-    // Distinct owner types, so each gets its own lock class.
-    struct OwnerA {};
-    struct OwnerB {};
-    struct OwnerC {};
-    struct OwnerD {};
-    struct OwnerE {};
-    struct OwnerF {};
-    struct OwnerNestable {};
-    struct OwnerLeaf {};
+// Distinct owner types, so each gets its own lock class.
+struct OwnerA {};
+struct OwnerB {};
+struct OwnerC {};
+struct OwnerD {};
+struct OwnerE {};
+struct OwnerF {};
+struct OwnerNestable {};
+struct OwnerLeaf {};
 
-    struct NestableLock {
-        auto acquire() -> void {}
-        auto release() -> void {}
-    };
-    LOCK_DEP_TRAITS(NestableLock, lockdep::ValidationControl::Nestable);
+struct NestableLock {
+    auto acquire() -> void {}
+    auto release() -> void {}
+};
+LOCK_DEP_TRAITS(NestableLock, lockdep::ValidationControl::Nestable);
 
-    struct LeafLock {
-        auto acquire() -> void {}
-        auto release() -> void {}
-    };
-    LOCK_DEP_TRAITS(LeafLock, lockdep::ValidationControl::Leaf);
+struct LeafLock {
+    auto acquire() -> void {}
+    auto release() -> void {}
+};
+LOCK_DEP_TRAITS(LeafLock, lockdep::ValidationControl::Leaf);
 
 } // namespace fake
 
 // --- environment seams -------------------------------------------------------
 
 namespace {
-    lockdep::Violation g_last_violation{};
-    int g_report_count = 0;
-    int g_cycle_reports = 0;
-    int g_reacquire_reports = 0;
-    int g_leaf_reports = 0;
+lockdep::Violation g_last_violation{};
+int g_report_count = 0;
+int g_cycle_reports = 0;
+int g_reacquire_reports = 0;
+int g_leaf_reports = 0;
 
-    auto reset_reports() -> void {
-        g_report_count = 0;
-        g_cycle_reports = 0;
-        g_reacquire_reports = 0;
-        g_leaf_reports = 0;
-    }
+auto reset_reports() -> void {
+    g_report_count = 0;
+    g_cycle_reports = 0;
+    g_reacquire_reports = 0;
+    g_leaf_reports = 0;
+}
 } // namespace
 
 namespace lockdep {
-    static LockContext g_context;
+static LockContext g_context;
 
-    auto current_lock_context() -> LockContext * {
-        return &g_context;
-    }
+auto current_lock_context() -> LockContext * {
+    return &g_context;
+}
 
-    auto report_violation(ViolationReport const &report) -> void {
-        g_last_violation = report.violation;
-        ++g_report_count;
-        switch (report.violation) {
-        case Violation::CircularDependency: ++g_cycle_reports; break;
-        case Violation::ReAcquire: ++g_reacquire_reports; break;
-        case Violation::LeafAcquire: ++g_leaf_reports; break;
-        case Violation::DependencySetFull: break;
-        }
+auto report_violation(ViolationReport const &report) -> void {
+    g_last_violation = report.violation;
+    ++g_report_count;
+    switch (report.violation) {
+        case Violation::CircularDependency:
+            ++g_cycle_reports;
+            break;
+        case Violation::ReAcquire:
+            ++g_reacquire_reports;
+            break;
+        case Violation::LeafAcquire:
+            ++g_leaf_reports;
+            break;
+        case Violation::DependencySetFull:
+            break;
     }
+}
 } // namespace lockdep
 
 // --- traits ------------------------------------------------------------------
 
-static_assert(lockdep::kLockControlOf<fake::SpinLock> == lockdep::ValidationControl::IrqSafe,
+static_assert(lockdep::LockControlV<fake::SpinLock> == lockdep::ValidationControl::IrqSafe,
               "declared traits must be picked up through ADL");
-static_assert(lockdep::kLockControlOf<fake::BareLock> == lockdep::ValidationControl::None,
+static_assert(lockdep::LockControlV<fake::BareLock> == lockdep::ValidationControl::None,
               "a lock with no LOCK_DEP_TRAITS must fall back to None");
 
 // --- state savers ------------------------------------------------------------
 
-static_assert(std::is_same_v<lockdep::StateSaver<fake::SpinLock, lockdep::SavedStateOption::IrqSave>,
+static_assert(std::is_same_v<lockdep::StateSaver<fake::SpinLock, lockdep::IrqSave>,
                              fake::AutoInterruptDisabler>,
               "StateSaver must resolve to the declared saver, not to a container");
-static_assert(
-    std::is_same_v<lockdep::StateSaver<fake::SpinLock, lockdep::SavedStateOption::PreemptDisable>,
-                   fake::AutoPreemptDisabler>,
-    "the option must select between the savers a lock declares");
-static_assert(std::is_same_v<lockdep::StateSaver<fake::BareLock, lockdep::SavedStateOption::IrqSave>,
-                             lockdep::NullStateSaver>,
-              "a lock with no saver must fall back to NullStateSaver");
+static_assert(std::is_same_v<lockdep::StateSaver<fake::SpinLock, lockdep::PreemptDisable>,
+                             fake::AutoPreemptDisabler>,
+              "the option must select between the savers a lock declares");
+// A lock that declares no saver for an option does not resolve one at all:
+// asking for it is a compile error, never a silent "save nothing".
+template <typename Lock, typename Option>
+concept HasStateSaver = requires { typename lockdep::StateSaver<Lock, Option>; };
+
+static_assert(!HasStateSaver<fake::BareLock, lockdep::IrqSave>,
+              "a lock with no saver must not fall back to saving nothing");
 
 // --- lock classes ------------------------------------------------------------
 
-static_assert(lockdep::kLockMetadataAvailable ==
-                  (lockdep::kEnabledFeatureLevel != lockdep::FeatureLevel::Disabled),
+static_assert(lockdep::LOCK_METADATA_AVAILABLE ==
+                  (lockdep::ENABLED_FEATURE_LEVEL != lockdep::FeatureLevel::Disabled),
               "metadata availability must track the feature level");
 
 auto class_ids_are_distinct() -> bool {
     auto const spin = lockdep::DefaultLockClass<fake::SpinLock>::id();
     auto const bare = lockdep::DefaultLockClass<fake::BareLock>::id();
-    if constexpr (lockdep::kLockMetadataAvailable) {
-        return spin != bare && spin != lockdep::kInvalidLockClassId;
+    if constexpr (lockdep::LOCK_METADATA_AVAILABLE) {
+        return spin != bare && spin != lockdep::INVALID_LOCK_CLASS_ID;
     } else {
-        return spin == lockdep::kInvalidLockClassId && bare == lockdep::kInvalidLockClassId;
+        return spin == lockdep::INVALID_LOCK_CLASS_ID && bare == lockdep::INVALID_LOCK_CLASS_ID;
     }
 }
 
@@ -161,17 +188,16 @@ auto combined_guard(fake::SpinLock &lock) -> bool {
 }
 
 auto tag_object_guard(fake::SpinLock &lock) -> bool {
-    lockdep::Guard guard{lock, lockdep::kIrqSave};
-    static_assert(
-        std::is_same_v<decltype(guard), lockdep::Guard<fake::SpinLock, lockdep::IrqSave>>,
-        "the deduction guide must carry the tag into the template arguments");
+    lockdep::Guard guard{lock, lockdep::IRQ_SAVE};
+    static_assert(std::is_same_v<decltype(guard), lockdep::Guard<fake::SpinLock, lockdep::IrqSave>>,
+                  "the deduction guide must carry the tag into the template arguments");
     return lock.held && fake::g_irq_depth == 1;
 }
 
 auto bare_lock_guard(fake::BareLock &lock) -> bool {
-    // Requesting IrqSave from a lock that declares no saver is a no-op, not an error.
-    lockdep::Guard<fake::BareLock, lockdep::IrqSave> guard{lock};
-    return fake::g_irq_depth == 0;
+    // A lock with no savers still guards with no options.
+    lockdep::Guard guard{lock};
+    return guard.held();
 }
 
 auto early_unlock(fake::SpinLock &lock) -> bool {
@@ -194,9 +220,8 @@ auto void_guard() -> bool {
 
 // With validation compiled out the entry, the context slot and the savers must
 // all vanish, leaving just the lock reference and the held flag.
-static_assert(lockdep::kLockValidationEnabled ||
-                  sizeof(lockdep::Guard<fake::BareLock, lockdep::IrqSaveAndPreemptDisable>) <=
-                      2 * sizeof(void *),
+static_assert(lockdep::LOCK_VALIDATION_ENABLED ||
+                  sizeof(lockdep::Guard<fake::BareLock>) <= 2 * sizeof(void *),
               "a guard must cost nothing extra when validation is disabled");
 
 // --- dependency graph --------------------------------------------------------
@@ -370,14 +395,14 @@ auto leaf_must_be_last() -> bool {
 // --- driver ------------------------------------------------------------------
 
 namespace {
-    int g_failures = 0;
+int g_failures = 0;
 
-    auto check(char const *name, bool ok) -> void {
-        if (!ok) {
-            std::printf("  FAIL: %s\n", name);
-            ++g_failures;
-        }
+auto check(char const *name, bool ok) -> void {
+    if (!ok) {
+        std::printf("  FAIL: %s\n", name);
+        ++g_failures;
     }
+}
 } // namespace
 
 auto main() -> int {
@@ -400,7 +425,7 @@ auto main() -> int {
 
     // The graph only exists when validation is compiled in.  Everywhere else
     // these paths must still run and simply observe nothing.
-    if constexpr (lockdep::kLockValidationEnabled) {
+    if constexpr (lockdep::LOCK_VALIDATION_ENABLED) {
         check("records_edges_in_one_direction", records_edges_in_one_direction());
         check("release_need_not_nest", release_need_not_nest());
         check("catches_transitive_cycle", catches_transitive_cycle());

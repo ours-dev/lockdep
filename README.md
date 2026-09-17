@@ -43,8 +43,10 @@ LOCKDEP_STATE_SAVER(MyLock, lockdep::SavedStateOption::IrqSave,
                     arch::AutoInterruptDisabler);
 ```
 
-Both are optional. A lock that declares neither gets default traits and no
-saver rather than a compile error.
+Traits are optional: a lock that declares none gets `ValidationControl::None`.
+A saver is not: asking a `Guard` for an option the lock declares no saver for
+does not compile, because the only other answer -- save nothing -- is the bug
+that left every `Guard<SpinLock, IrqSave>` running with interrupts enabled.
 
 ## Feature levels
 
