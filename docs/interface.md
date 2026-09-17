@@ -2,8 +2,13 @@
 
 This is the public interface lockdep should expose, modeled on Zircon's
 lockdep (`fuchsia/src/lib/lockdep/include/lockdep/`, kernel glue in
-`fuchsia/zircon/kernel/lib/lockdep/lock_dep.cc`). It is a proposal: the
-current headers predate it and are to be reshaped to match.
+`fuchsia/zircon/kernel/lib/lockdep/lock_dep.cc`). The current headers predate
+it and are to be reshaped to match.
+
+Two choices below were put to the maintainer and settled rather than inferred:
+a lock's class is named by a tag type, not by Zircon's `__LINE__` macro; and
+`Guard` accepts only `lockdep::Lock<T>`, with no transitional overload for raw
+locks.
 
 Where the design keeps Zircon's shape the Zircon file is cited so the two can
 be compared. Where it departs, the reason is given — usually one of this
