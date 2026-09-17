@@ -1,7 +1,7 @@
 #pragma once
 
 namespace lockdep {
-    class LockClassState;
+class LockClassState;
 
-    using LockClassId = LockClassState const *;
+using LockClassId = LockClassState const *;
 } // namespace lockdep
