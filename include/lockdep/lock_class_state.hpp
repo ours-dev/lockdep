@@ -8,7 +8,7 @@
 #include <lockdep/report.hpp>
 #include <lockdep/types.hpp>
 
-#include <ustl/sync/atomic.hpp>
+#include <atomic>
 
 namespace lockdep {
 /// Base of every lock class state.  Its address is the class id, so it must
@@ -19,6 +19,7 @@ class LockClassState {
   public:
     constexpr LockClassState() = default;
 
+    [[nodiscard]]
     constexpr auto id() const -> LockClassId {
         return this;
     }
@@ -31,26 +32,29 @@ class LockClassState {
 /// This is what a `MetadataOnly` build gets.
 class MetadataLockClassState: public LockClassState {
   public:
-    constexpr explicit MetadataLockClassState(ValidationControl control) : m_control(control) {}
+    constexpr explicit MetadataLockClassState(ValidationOptions options) : m_options(options) {}
 
-    constexpr auto control() const -> ValidationControl {
-        return m_control;
+    [[nodiscard]]
+    constexpr auto options() const -> ValidationOptions {
+        return m_options;
     }
 
-    /// Whether every bit in `control` is set for this class.
-    constexpr auto has(ValidationControl control) const -> bool {
-        return (m_control & control) == control;
+    /// Whether every bit in `options` is set for this class.
+    [[nodiscard]]
+    constexpr auto has(ValidationOptions options) const -> bool {
+        return (m_options & options) == options;
     }
 
-    /// Whether any bit in `control` is set for this class.
-    constexpr auto has_any(ValidationControl control) const -> bool {
-        return (m_control & control) != ValidationControl::None;
+    /// Whether any bit in `options` is set for this class.
+    [[nodiscard]]
+    constexpr auto has_any(ValidationOptions options) const -> bool {
+        return (m_options & options) != ValidationOptions::None;
     }
 
   protected:
     /// Lives here rather than in the validator so that metadata-only builds
     /// can still report what a lock class declared.
-    ValidationControl m_control;
+    ValidationOptions m_options;
 };
 
 /// A node in the lock dependency graph.
@@ -71,13 +75,13 @@ class ValidatorLockClassState: public MetadataLockClassState {
   public:
     /// Constant-initialisable, so the per-class state in `LockClass` needs
     /// no static constructor to run before the first acquisition.
-    constexpr explicit ValidatorLockClassState(ValidationControl control)
-        : MetadataLockClassState(control) {}
+    constexpr explicit ValidatorLockClassState(ValidationOptions options)
+        : MetadataLockClassState(options) {}
 
     /// Head of the registry of every class that has taken part in an
     /// acquisition.  The detector walks it to find roots.
     static auto registry() -> Self * {
-        return m_registry.load(ustl::sync::MemoryOrder::Acquire);
+        return m_registry.load(std::memory_order_acquire);
     }
 
     auto next_class() const -> Self * {
@@ -91,29 +95,31 @@ class ValidatorLockClassState: public MetadataLockClassState {
     /// the worst case is that a detector pass running right then does not
     /// see this class, and the next pass does.
     auto ensure_registered() -> void {
-        using ustl::sync::MemoryOrder;
-        if (m_registered.load(MemoryOrder::Acquire)) {
+        if (m_registered.load(std::memory_order_acquire)) {
             return;
         }
-        if (m_registered.exchange(1, MemoryOrder::AcqRel)) {
+        if (m_registered.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
 
-        auto *head = m_registry.load(MemoryOrder::Relaxed);
+        auto *head = m_registry.load(std::memory_order_relaxed);
         do {
             m_next_class = head;
-        } while (!m_registry.compare_exchange_weak(head, this, MemoryOrder::Release,
-                                                   MemoryOrder::Relaxed));
+        } while (!m_registry.compare_exchange_weak(head, this, std::memory_order_release,
+                                                   std::memory_order_relaxed));
     }
 
     /// Number of successors recorded so far, clamped to the capacity.
     auto dependency_count() const -> usize {
-        auto const count = m_dependency_count.load(ustl::sync::MemoryOrder::Acquire);
-        return count < MAX_DEPENDENCIES ? count : MAX_DEPENDENCIES;
+        auto const count = m_dependency_count.load(std::memory_order_acquire);
+        if (count < MAX_DEPENDENCIES) {
+            return count;
+        }
+        return MAX_DEPENDENCIES;
     }
 
     auto dependency_at(usize index) const -> Self * {
-        return m_dependencies[index].load(ustl::sync::MemoryOrder::Acquire);
+        return m_dependencies[index].load(std::memory_order_acquire);
     }
 
     auto has_dependency(Self const *dependency) const -> bool {
@@ -133,17 +139,16 @@ class ValidatorLockClassState: public MetadataLockClassState {
     /// duplicate check and take two slots.  That wastes capacity but does
     /// not change what the detector concludes.
     auto add_dependency(Self *dependency) -> bool {
-        using ustl::sync::MemoryOrder;
         if (has_dependency(dependency)) {
             return true;
         }
 
-        auto const slot = m_dependency_count.fetch_add(1, MemoryOrder::AcqRel);
+        auto const slot = m_dependency_count.fetch_add(1, std::memory_order_acq_rel);
         if (slot >= MAX_DEPENDENCIES) {
             return false;
         }
 
-        m_dependencies[slot].store(dependency, MemoryOrder::Release);
+        m_dependencies[slot].store(dependency, std::memory_order_release);
         return true;
     }
 
@@ -161,27 +166,27 @@ class ValidatorLockClassState: public MetadataLockClassState {
 
     /// Whether this class opted out of order tracking entirely.
     constexpr auto tracking_disabled() const -> bool {
-        return has(ValidationControl::TrackingDisabled);
+        return has(ValidationOptions::TrackingDisabled);
     }
 
     /// Whether a context may hold two locks of this class at once.
     constexpr auto nestable() const -> bool {
-        return has_any(ValidationControl::Nestable | ValidationControl::MultiAcquire);
+        return has_any(ValidationOptions::Nestable | ValidationOptions::MultiAcquire);
     }
 
     class LoopDetector;
 
   private:
     /// Registry of every class that has been acquired at least once.
-    static inline ustl::sync::Atomic<Self *> m_registry{nullptr};
+    static inline std::atomic<Self *> m_registry{nullptr};
 
     Self *m_next_class{nullptr};
-    ustl::sync::AtomicU32 m_registered{0};
+    std::atomic<bool> m_registered{false};
 
     /// Successors of this class.  Append-only: an edge is never withdrawn,
     /// because an ordering observed once stays a fact about the code.
-    ustl::sync::AtomicUsize m_dependency_count{0};
-    ustl::sync::Atomic<Self *> m_dependencies[MAX_DEPENDENCIES]{};
+    std::atomic<usize> m_dependency_count{0};
+    std::atomic<Self *> m_dependencies[MAX_DEPENDENCIES]{};
 
     /// Scratch space for `LoopDetector`.  It lives in the node so the walk
     /// needs no stack of its own: `parent` is the depth-first call stack and
@@ -236,7 +241,7 @@ class ValidatorLockClassState::LoopDetector {
         // live in the graph and outlast any one detector, so a fresh
         // detector starting over at one would read the previous pass's
         // marks as its own and skip the whole graph.
-        m_generation = m_next_generation.fetch_add(1, ustl::sync::MemoryOrder::AcqRel) + 1;
+        m_generation = m_next_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
         m_index = 0;
         m_stack = nullptr;
 
@@ -297,15 +302,15 @@ class ValidatorLockClassState::LoopDetector {
     }
 
     static auto report(ValidatorLockClassState *root, ValidatorLockClassState *member) -> void {
-        if (root->has(ValidationControl::ReportingDisabled) ||
-            member->has(ValidationControl::ReportingDisabled)) {
+        if (root->has(ValidationOptions::ReportingDisabled) ||
+            member->has(ValidationOptions::ReportingDisabled)) {
             return;
         }
         report_violation(ViolationReport{
             Violation::CircularDependency,
             member->id(),
             root->id(),
-            root->has(ValidationControl::ReAcquireFatal),
+            root->has(ValidationOptions::ReAcquireFatal),
         });
     }
 
@@ -358,7 +363,7 @@ class ValidatorLockClassState::LoopDetector {
     /// Shared by every detector so that no pass ever reuses the number a
     /// previous pass stamped into the graph.  Node marks start at zero, so
     /// the first pass is generation one.
-    static inline ustl::sync::AtomicUsize m_next_generation{0};
+    static inline std::atomic<usize> m_next_generation{0};
 
     usize m_generation{0};
     usize m_index{0};

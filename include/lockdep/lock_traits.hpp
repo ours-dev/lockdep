@@ -9,7 +9,7 @@
 #include <ustl/util/enum_bits.hpp>
 
 namespace lockdep {
-enum class ValidationControl {
+enum class ValidationOptions {
     None = 0,
 
     IrqSafe = (1 << 0),
@@ -30,16 +30,16 @@ enum class ValidationControl {
 
     TrackingDisabled = (1 << 8),
 };
-USTL_ENABLE_ENUM_BITMASK(ValidationControl);
+USTL_ENABLE_ENUM_BITMASK(ValidationOptions);
 
-template <typename Lock, ValidationControl Control>
+template <typename Lock, ValidationOptions Options>
 struct LockTraitsImpl {
     using LockType = Lock;
 
-    constexpr static auto CONTROL = Control;
+    constexpr static auto OPTIONS = Options;
 
-    constexpr static auto has(ValidationControl control) -> bool {
-        return (CONTROL & control) != ValidationControl::None;
+    constexpr static auto has(ValidationOptions options) -> bool {
+        return (OPTIONS & options) != ValidationOptions::None;
     }
 };
 
@@ -54,7 +54,7 @@ struct LockTraitsImpl {
 /// default traits -- Zircon gets the same effect from the primary LockTraits
 /// template in lockdep/lock_class.h.
 constexpr auto lock_dep_extract_traits_helper(void const volatile *)
-    -> ustl::traits::IntConstant<lockdep::ValidationControl::None>;
+    -> ustl::traits::IntConstant<lockdep::ValidationOptions::None>;
 
 namespace lockdep {
 /// This used to resolve through ustl::Tuple, ustl::TupleElementT and
@@ -72,15 +72,15 @@ template <typename Lock>
 using LockTraits = typename MakeLockTraits<Lock>::Type;
 
 template <typename Lock>
-constexpr auto LockControlV = LockTraits<Lock>::CONTROL;
+constexpr auto LockValidationOptionsV = LockTraits<Lock>::OPTIONS;
 
 } // namespace lockdep
 
 /// Using a function rather than a class bypasses the namespace issues brought
 /// by template class instantiation: the declaration can sit right next to the
 /// lock type and still be found through ADL from inside lockdep.
-#define LOCK_DEP_TRAITS(LOCK_TYPE, VALIDATION_CONTROL)                                             \
+#define LOCK_DEP_TRAITS(LOCK_TYPE, VALIDATION_OPTIONS)                                             \
     constexpr auto lock_dep_extract_traits_helper(LOCK_TYPE *)                                     \
-        -> ustl::traits::IntConstant<VALIDATION_CONTROL>;
+        -> ustl::traits::IntConstant<VALIDATION_OPTIONS>;
 
 #endif // #ifndef LOCKDEP_LOCK_TRAITS_HPP

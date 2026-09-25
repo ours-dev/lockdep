@@ -32,6 +32,7 @@ namespace priv {
     /// 23 reports and older compilers silently let through.
     template <bool Enabled>
     struct ContextHolder {
+        [[nodiscard]]
         auto get() const -> ::lockdep::LockContext * {
             return m_context;
         }
@@ -45,6 +46,7 @@ namespace priv {
 
     template <>
     struct ContextHolder<false> {
+        [[nodiscard]]
         auto get() const -> ::lockdep::LockContext * {
             return nullptr;
         }
@@ -148,6 +150,7 @@ class TA_SCOPED_CAPABILITY Guard {
         }
     }
 
+    [[nodiscard]]
     auto held() const -> bool {
         return !m_unlocked;
     }
@@ -235,6 +238,7 @@ class Guard<void> {
 
     auto unlock() -> void {}
     auto unguard() -> void {}
+    [[nodiscard]]
     auto held() const -> bool {
         return false;
     }
