@@ -48,6 +48,18 @@ A saver is not: asking a `Guard` for an option the lock declares no saver for
 does not compile, because the only other answer -- save nothing -- is the bug
 that left every `Guard<SpinLock, IrqSave>` running with interrupts enabled.
 
+A lock whose `acquire()` changes nothing about the running CPU -- a spin lock --
+has no safe option-less form either, and can say so:
+
+```cpp
+auto lockdep_option_required(MyLock *) -> void;   // declared, never defined
+```
+
+`Guard<MyLock>` (which is what `Guard guard{lock}` deduces to) then fails to
+compile, and every call site has to name the state it saves. That is Zircon's
+`LOCK_DEP_POLICY_OPTION`, which leaves the lock's option-less policy ambiguous
+for the same reason.
+
 ## Feature levels
 
 The level comes from the build, never from the source. `config("lockdep")` in

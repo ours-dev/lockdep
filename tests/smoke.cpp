@@ -56,6 +56,15 @@ struct BareLock {
     auto release() -> void {}
 };
 
+// A lock that, like the kernel's SpinLock, cannot be held safely without a
+// saver, and says so: a Guard on it must name an option.
+struct StrictLock {
+    auto acquire() -> void {}
+    auto release() -> void {}
+};
+LOCKDEP_STATE_SAVER(StrictLock, lockdep::SavedStateOption::IrqSave, AutoInterruptDisabler);
+auto lockdep_option_required(StrictLock *) -> void;
+
 LOCK_DEP_TRAITS(SpinLock, lockdep::ValidationControl::IrqSafe);
 LOCKDEP_STATE_SAVER(SpinLock, lockdep::SavedStateOption::IrqSave, AutoInterruptDisabler);
 LOCKDEP_STATE_SAVER(SpinLock, lockdep::SavedStateOption::PreemptDisable, AutoPreemptDisabler);
@@ -153,6 +162,15 @@ concept HasStateSaver = requires { typename lockdep::StateSaver<Lock, Option>; }
 static_assert(!HasStateSaver<fake::BareLock, lockdep::IrqSave>,
               "a lock with no saver must not fall back to saving nothing");
 
+// Guard static_asserts on this, so an option-less Guard on StrictLock does not
+// compile. That failure cannot be observed from here -- a static_assert in a
+// class body is not a substitution failure -- so the trait it rests on is
+// what is checked, in both directions.
+static_assert(lockdep::OptionRequired<fake::StrictLock>,
+              "a lock that declares lockdep_option_required() must require an option");
+static_assert(!lockdep::OptionRequired<fake::SpinLock> && !lockdep::OptionRequired<fake::BareLock>,
+              "a lock that declares nothing must keep guarding without options");
+
 // --- lock classes ------------------------------------------------------------
 
 static_assert(lockdep::LOCK_METADATA_AVAILABLE ==
@@ -198,6 +216,12 @@ auto bare_lock_guard(fake::BareLock &lock) -> bool {
     // A lock with no savers still guards with no options.
     lockdep::Guard guard{lock};
     return guard.held();
+}
+
+auto strict_guard(fake::StrictLock &lock) -> bool {
+    // The only spelling StrictLock accepts.
+    lockdep::Guard<fake::StrictLock, lockdep::IrqSave> guard{lock};
+    return guard.held() && fake::g_irq_depth == 1;
 }
 
 auto early_unlock(fake::SpinLock &lock) -> bool {
@@ -409,6 +433,7 @@ auto main() -> int {
     fake::SpinLock a;
     fake::SpinLock b;
     fake::BareLock bare;
+    fake::StrictLock strict;
 
     check("class_ids_are_distinct", class_ids_are_distinct());
     check("plain_guard", plain_guard(a));
@@ -416,6 +441,7 @@ auto main() -> int {
     check("combined_guard", combined_guard(a));
     check("tag_object_guard", tag_object_guard(a));
     check("bare_lock_guard", bare_lock_guard(bare));
+    check("strict_guard", strict_guard(strict));
     check("early_unlock", early_unlock(a));
     check("scoped_guard", scoped_guard(a, b));
     check("void_guard", void_guard());

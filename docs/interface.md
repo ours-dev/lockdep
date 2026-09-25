@@ -155,10 +155,19 @@ the lock type:
 
 ```cpp
 namespace ours::sync {
-    auto lockdep_policy(SpinLock *, void *)            -> NoIrqSavePolicy;   // Guard<SpinLock>
-    auto lockdep_policy(SpinLock *, lockdep::IrqSave *) -> IrqSavePolicy;    // Guard<SpinLock, IrqSave>
+    auto lockdep_policy(SpinLock *, lockdep::NoIrqSave *) -> NoIrqSavePolicy;  // Guard<SpinLock, NoIrqSave>
+    auto lockdep_policy(SpinLock *, lockdep::IrqSave *)   -> IrqSavePolicy;    // Guard<SpinLock, IrqSave>
 }
 ```
+
+A spin lock declares no `void` policy, so `Guard<SpinLock>` does not compile:
+every holder names what it saves, as with Zircon's `LOCK_DEP_POLICY_OPTION`.
+An earlier draft of this example mapped `void` to `NoIrqSavePolicy`; that is
+the option-less `Guard guard{spinlock}` the current headers refuse through
+`lockdep_option_required()`, which had held every such lock with interrupts
+and preemption both enabled. `NoIrqSave` is for a caller that already has
+interrupts off and says so, as in Zircon, where `SpinLock::Acquire()` asserts
+it.
 
 Option tags are plain empty types owned by lockdep — `IrqSave`, `NoIrqSave`,
 `PreemptDisable`, `IrqSaveAndPreemptDisable`, `TryLock` — so a look-alike
