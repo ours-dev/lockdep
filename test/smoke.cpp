@@ -6,6 +6,7 @@
 #include <lockdep/lock_class.hpp>
 #include <lockdep/lock_class_state.hpp>
 #include <lockdep/lock_context.hpp>
+#include <lockdep/lock_policy.hpp>
 #include <lockdep/lock_traits.hpp>
 #include <lockdep/report.hpp>
 #include <lockdep/state_saver.hpp>
@@ -14,6 +15,8 @@
 #include <tuple>
 
 #include <cstdio>
+
+#include <ours/compiler.hpp>
 
 namespace fake {
 
@@ -94,7 +97,102 @@ struct LeafLock {
 };
 LOCK_DEP_TRAITS(LeafLock, lockdep::ValidationOptions::Leaf);
 
+// A lock annotated the way the kernel's locks are, so that -Wthread-safety
+// checks what Guard and the policies do with it. The other fakes carry no
+// annotations, and a policy that took a lock unannotated compiled cleanly
+// against them while failing on every lock in the kernel.
+struct TA_CAPABILITY("mutex") AnnotatedLock {
+    TA_ACQUIRE()
+    auto acquire() -> void {}
+
+    TA_RELEASE()
+    auto release() -> void {}
+};
+LOCKDEP_STATE_SAVER(AnnotatedLock, lockdep::SavedStateOption::IrqSave, AutoInterruptDisabler);
+
+// A lock that declares policies of its own, the way the kernel's locks are
+// meant to, including a try-lock that can fail.
+struct PolicyLock {
+    auto acquire() -> void {
+        held = true;
+    }
+    auto try_acquire() -> bool {
+        if (busy) {
+            return false;
+        }
+        held = true;
+        return true;
+    }
+    auto release() -> void {
+        held = false;
+    }
+    bool held{false};
+    bool busy{false};
+};
+
+// What the Guard asked of TracingPolicy, in order, and whether the lock
+// context already held a record of the acquisition at each call.
+struct TraceEntry {
+    char call;
+    bool recorded;
+};
+inline TraceEntry g_trace[8]{};
+inline int g_trace_length = 0;
+inline int g_saved = 0;
+
+inline auto trace(char const call) -> void {
+    g_trace[g_trace_length] = TraceEntry{call, !lockdep::current_lock_context()->empty()};
+    ++g_trace_length;
+}
+
+// Saves "state" in pre_validate() and tries the lock in acquire(); a failed
+// try undoes what pre_validate() did, which is the policy's job, not the
+// Guard's.
+struct TracingPolicy {
+    struct State {
+        bool saved{false};
+    };
+
+    using ValidationGuard = lockdep::NullValidationGuard;
+
+    static auto pre_validate(PolicyLock &, State &state) -> void {
+        trace('p');
+        state.saved = true;
+        ++g_saved;
+    }
+
+    static auto acquire(PolicyLock &lock, State &state) -> bool {
+        trace('a');
+        if (lock.try_acquire()) {
+            return true;
+        }
+        state.saved = false;
+        --g_saved;
+        return false;
+    }
+
+    static auto release(PolicyLock &lock, State &state) -> void {
+        trace('r');
+        lock.release();
+        state.saved = false;
+        --g_saved;
+    }
+};
+
+// An option tag of the lock's own: policies are not limited to lockdep's.
+struct TryLock {};
+
+auto lockdep_policy(PolicyLock *, TryLock *) -> TracingPolicy;
+// Both a saver and a policy for IrqSave: the declared policy has to win.
+LOCKDEP_STATE_SAVER(PolicyLock, lockdep::SavedStateOption::IrqSave, AutoInterruptDisabler);
+auto lockdep_policy(PolicyLock *, lockdep::IrqSave *) -> TracingPolicy;
+
 } // namespace fake
+
+namespace lookalike {
+// What ours::IrqSave used to be: an empty struct with the right name.
+struct IrqSave {};
+} // namespace lookalike
 
 // --- environment seams -------------------------------------------------------
 
@@ -172,6 +270,26 @@ static_assert(lockdep::OptionRequired<fake::StrictLock>,
 static_assert(!lockdep::OptionRequired<fake::SpinLock> && !lockdep::OptionRequired<fake::BareLock>,
               "a lock that declares nothing must keep guarding without options");
 
+// --- policy lookup -----------------------------------------------------------
+
+static_assert(lockdep::HasPolicy<fake::BareLock, lockdep::NoOption>,
+              "a lock with no declarations is held with DefaultLockPolicy");
+static_assert(!lockdep::HasPolicy<fake::StrictLock, lockdep::NoOption>,
+              "a lock that demands an option has no option-less policy");
+static_assert(!lockdep::HasPolicy<fake::BareLock, lockdep::IrqSave>,
+              "an option the lock declares nothing for has no policy");
+static_assert(!lockdep::HasPolicy<fake::SpinLock, lookalike::IrqSave>,
+              "a look-alike tag matches no policy");
+static_assert(
+    std::is_same_v<lockdep::PolicyFor<fake::PolicyLock, lockdep::IrqSave>, fake::TracingPolicy>,
+    "a declared policy wins over a declared saver");
+static_assert(
+    std::is_same_v<lockdep::PolicyFor<fake::PolicyLock, fake::TryLock>, fake::TracingPolicy>,
+    "a lock's own option tags resolve like lockdep's");
+static_assert(
+    lockdep::LockPolicy<lockdep::PolicyFor<fake::SpinLock, lockdep::IrqSave>, fake::SpinLock>,
+    "a state saver is presented as a complete policy");
+
 // --- lock classes ------------------------------------------------------------
 
 static_assert(lockdep::LOCK_METADATA_AVAILABLE ==
@@ -228,7 +346,89 @@ auto strict_guard(fake::StrictLock &lock) -> bool {
 auto early_unlock(fake::SpinLock &lock) -> bool {
     lockdep::Guard<fake::SpinLock, lockdep::IrqSave> guard{lock};
     guard.unlock();
-    return !lock.held && !guard.held();
+    // Restored at the unlock, not at the end of the scope.
+    return !lock.held && !guard.held() && fake::g_irq_depth == 0;
+}
+
+auto unguard_keeps_saved_state(fake::SpinLock &lock) -> bool {
+    auto kept = false;
+    {
+        lockdep::Guard<fake::SpinLock, lockdep::IrqSave> guard{lock};
+        guard.unguard();
+        // Handed off, not released: the lock stays taken and the state stays
+        // saved, but the record of the acquisition is gone with the frame.
+        kept = lock.held && !guard.held() && fake::g_irq_depth == 1 &&
+               lockdep::current_lock_context()->empty();
+    }
+    // The new owner releases; the frame that saved the state restored it.
+    lock.release();
+    return kept && fake::g_irq_depth == 0;
+}
+
+// Guard over an annotated lock, through both DefaultLockPolicy and a saver
+// adapted into a policy, including an early unlock.
+auto annotated_guards(fake::AnnotatedLock &lock) -> bool {
+    {
+        lockdep::Guard guard{lock};
+    }
+    lockdep::Guard<fake::AnnotatedLock, lockdep::IrqSave> guard{lock};
+    auto const saved = fake::g_irq_depth == 1;
+    guard.unlock();
+    return saved && fake::g_irq_depth == 0;
+}
+
+auto reset_trace() -> void {
+    fake::g_trace_length = 0;
+    fake::g_saved = 0;
+}
+
+auto trace_is(char const *calls, bool const *recorded) -> bool {
+    auto length = 0;
+    while (calls[length] != 0) {
+        ++length;
+    }
+    if (fake::g_trace_length != length) {
+        return false;
+    }
+    for (auto i = 0; i < length; ++i) {
+        if (fake::g_trace[i].call != calls[i] || fake::g_trace[i].recorded != recorded[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// pre_validate() before the record, acquire() after it, release() after the
+// record is gone. The record only exists where validation is compiled in.
+auto policy_order() -> bool {
+    fake::PolicyLock lock;
+    reset_trace();
+    {
+        lockdep::Guard<fake::PolicyLock, fake::TryLock> guard{lock};
+        if (!guard.held() || !lock.held || fake::g_saved != 1) {
+            return false;
+        }
+    }
+    constexpr auto V = lockdep::LOCK_VALIDATION_ENABLED;
+    bool const recorded[] = {false, V, false};
+    return trace_is("par", recorded) && fake::g_saved == 0 && !lock.held;
+}
+
+// A try-lock that fails leaves no record, no saved state and nothing to
+// release.
+auto failed_try_lock() -> bool {
+    fake::PolicyLock lock;
+    lock.busy = true;
+    reset_trace();
+    auto nothing_left = false;
+    {
+        lockdep::Guard<fake::PolicyLock, fake::TryLock> guard{lock};
+        nothing_left = !guard.held() && !static_cast<bool>(guard) && fake::g_saved == 0 &&
+                       lockdep::current_lock_context()->empty();
+    }
+    constexpr auto V = lockdep::LOCK_VALIDATION_ENABLED;
+    bool const recorded[] = {false, V};
+    return nothing_left && trace_is("pa", recorded);
 }
 
 auto scoped_guard(fake::SpinLock &a, fake::SpinLock &b) -> bool {
@@ -435,6 +635,7 @@ auto main() -> int {
     fake::SpinLock b;
     fake::BareLock bare;
     fake::StrictLock strict;
+    fake::AnnotatedLock annotated;
 
     check("class_ids_are_distinct", class_ids_are_distinct());
     check("plain_guard", plain_guard(a));
@@ -444,6 +645,10 @@ auto main() -> int {
     check("bare_lock_guard", bare_lock_guard(bare));
     check("strict_guard", strict_guard(strict));
     check("early_unlock", early_unlock(a));
+    check("annotated_guards", annotated_guards(annotated));
+    check("unguard_keeps_saved_state", unguard_keeps_saved_state(a));
+    check("policy_order", policy_order());
+    check("failed_try_lock", failed_try_lock());
     check("scoped_guard", scoped_guard(a, b));
     check("void_guard", void_guard());
 
@@ -469,6 +674,7 @@ auto main() -> int {
 
     if (g_failures != 0) {
         std::printf("  %d check(s) failed\n", g_failures);
+        return 1;
     }
-    return g_failures == 0 ? 0 : 1;
+    return 0;
 }

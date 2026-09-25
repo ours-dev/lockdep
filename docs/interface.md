@@ -5,10 +5,11 @@ lockdep (`fuchsia/src/lib/lockdep/include/lockdep/`, kernel glue in
 `fuchsia/zircon/kernel/lib/lockdep/lock_dep.cc`). The current headers predate
 it and are to be reshaped to match.
 
-Two choices below were put to the maintainer and settled rather than inferred:
-a lock's class is named by a tag type, not by Zircon's `__LINE__` macro; and
-`Guard` accepts only `lockdep::Lock<T>`, with no transitional overload for raw
-locks.
+Three choices below were put to the maintainer and settled rather than
+inferred: a lock's class is named by a tag type, not by Zircon's `__LINE__`
+macro; `Guard` accepts only `lockdep::Lock<T>`, with no transitional overload
+for raw locks; and releasing a guard early restores what its policy saved at
+that point, as Zircon's `Guard::Release()` does, not at the end of the scope.
 
 Where the design keeps Zircon's shape the Zircon file is cited so the two can
 be compared. Where it departs, the reason is given — usually one of this
@@ -166,24 +167,35 @@ namespace ours::sync {
 }
 ```
 
-A spin lock declares no `void` policy, so `Guard<SpinLock>` does not compile:
-every holder names what it saves, as with Zircon's `LOCK_DEP_POLICY_OPTION`.
-An earlier draft of this example mapped `void` to `NoIrqSavePolicy`; that is
-the option-less `Guard guard{spinlock}` the current headers refuse through
-`lockdep_option_required()`, which had held every such lock with interrupts
-and preemption both enabled. `NoIrqSave` is for a caller that already has
-interrupts off and says so, as in Zircon, where `SpinLock::Acquire()` asserts
-it.
+`Guard<Lock>` looks up the option `NoOption`. Zircon uses `void` there; a
+`void *` parameter, though, would also accept every option tag the lock
+declares nothing for, through the implicit `T *` to `void *` conversion, and
+quietly resolve it to the option-less policy instead of failing to compile.
 
-Option tags are plain empty types owned by lockdep — `IrqSave`, `NoIrqSave`,
-`PreemptDisable`, `IrqSaveAndPreemptDisable`, `TryLock` — so a look-alike
-declared elsewhere cannot be passed by accident: it would find no policy and
-fail to compile.
+A lock with no safe way to be held without an option says so with
+`auto lockdep_option_required(Lock *) -> void;`, and then has no option-less
+policy: `Guard<SpinLock>` does not compile, and every holder names what it
+saves, as with Zircon's `LOCK_DEP_POLICY_OPTION`. It was an option-less
+`Guard guard{spinlock}` that held a PmZone lock with interrupts and preemption
+both enabled. `NoIrqSave` is for a caller that already has interrupts off and
+says so, as in Zircon, where `SpinLock::Acquire()` asserts it.
 
-**No default policy**, as in Zircon's kernel build: `DefaultLockPolicy` is
-compiled in only when `LOCK_DEP_ENABLE_DEFAULT_LOCK_POLICY` is set, because a
-default cannot know whether the environment needs a validation guard. A lock
-type with no policy is a compile error carrying the concept's diagnostic.
+Otherwise a lock that declares no option-less policy gets `DefaultLockPolicy`,
+which calls `acquire()` and `release()` and nothing else. Zircon's kernel build
+has no default at all; here the kernel's mutexes are guarded without an option
+and rely on it, and the lock that must not have a default is the one that says
+so.
+
+Option tags are empty types. lockdep owns the common ones -- `IrqSave`,
+`PreemptDisable`, `IrqSaveAndPreemptDisable` -- and a lock may define its own
+for a policy only it has, such as a try-lock. A look-alike declared elsewhere,
+which is what `ours::IrqSave` once was, finds no policy and fails to compile.
+
+**State savers keep working.** A lock that declares a saver through
+`LOCKDEP_STATE_SAVER` rather than a policy is held through `SaverPolicy`, which
+constructs the saver in `pre_validate()` and destroys it in `release()`. A
+declared policy wins where a lock has both. The savers are a transition, not a
+second interface: nothing new should be declared through them.
 
 ## Lock classes — `lock_class.hpp`
 
@@ -259,7 +271,7 @@ something needs it.
 ## Guards — `guard.hpp`
 
 ```cpp
-template <typename LockType, typename Option = void>
+template <typename LockType, typename Option = NoOption>
 class Guard {
   public:
     template <typename... StateArgs>
@@ -287,7 +299,7 @@ class Guard {
     auto operator=(Guard const &) -> Guard & = delete;
 };
 
-template <typename LockType, typename Option = void>
+template <typename LockType, typename Option = NoOption>
 auto assert_held(Lock<LockType> const &) -> void;
 
 class NullGuard;   // same surface, does nothing
@@ -313,7 +325,7 @@ nestable lock needs them.
 ## Several locks of one class — `guard_multiple.hpp`
 
 ```cpp
-template <usize N, typename LockType, typename Option = void>
+template <usize N, typename LockType, typename Option = NoOption>
 class GuardMultiple {
   public:
     explicit GuardMultiple(std::array<Lock<LockType> *, N> locks);  // all of one class

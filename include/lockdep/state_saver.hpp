@@ -7,6 +7,15 @@
 
 #include <ustl/util/enum_bits.hpp>
 
+/// The state-saver interface: the older of the two ways a lock type tells a
+/// Guard how to hold it.
+///
+/// A saver only brackets an acquisition -- an RAII object alive while the lock
+/// is held -- and cannot take part in it. lock_policy.hpp replaces it with a
+/// policy that owns the acquire and release themselves, and presents every
+/// saver declared here as such a policy (priv::SaverPolicy), so locks written
+/// against this interface keep working while they move over. Nothing new
+/// should be declared through it.
 namespace lockdep {
 enum class SavedStateOption {
     IrqSave = (1 << 0),
@@ -18,19 +27,6 @@ USTL_ENABLE_ENUM_BITMASK(SavedStateOption);
 
 template <SavedStateOption Option>
 struct SavedStateContainer {};
-
-/// Whether |T| is one of the tags a Guard accepts as an option.
-///
-/// Guard checks its options against this so that a look-alike tag -- an empty
-/// struct of the same name declared somewhere else, which is exactly what
-/// ours::IrqSave used to be -- is rejected with a message that names the
-/// mistake, rather than surfacing as a failed lookup of
-/// lockdep_get_state_saver() several instantiations deep.
-template <typename T>
-constexpr bool IsSavedStateContainerV = false;
-
-template <SavedStateOption Option>
-constexpr bool IsSavedStateContainerV<SavedStateContainer<Option>> = true;
 
 /// The state-saving object a Guard has to hold for |Option| while it guards a
 /// |Lock|, where |Option| is one of the SavedStateContainer tags below.
@@ -64,33 +60,6 @@ constexpr bool IsSavedStateContainerV<SavedStateContainer<Option>> = true;
 template <typename Lock, typename Option>
 using StateSaver =
     decltype(lockdep_get_state_saver(static_cast<Lock *>(nullptr), static_cast<Option *>(nullptr)));
-
-/// Whether a Guard on |Lock| has to name at least one option.
-///
-/// A lock opts in by declaring -- never defining -- an overload next to its
-/// own type, found by argument-dependent lookup exactly as its state savers
-/// are:
-///
-///     auto lockdep_option_required(MyLock *) -> void;
-///
-/// It is for a lock whose acquire() changes nothing about the running CPU, so
-/// that holding it safely depends entirely on a saver. A spin lock is the
-/// case in point: a `Guard<SpinLock>` with no option holds it with interrupts
-/// and preemption both enabled, and the holder can be preempted -- or
-/// interrupted by a handler that wants the same lock -- while the next thing
-/// to run on that CPU spins on it for ever. Such a lock has no safe default,
-/// so the only answer is to make the caller say which state it saves.
-///
-/// Zircon reaches the same place by another road: LOCK_DEP_POLICY_OPTION in
-/// lock_policy.h declares the lock's `void` option as AmbiguousOption, and
-/// Guard's static_assert refuses it. The `void` spelling does not carry over
-/// to StateSaver, which looks an option up through a pointer to it: a void*
-/// parameter would also catch every option tag the lock declares no saver
-/// for, through the implicit T* -> void* conversion, and quietly resolve it
-/// to this marker instead of failing to compile. A hook with a name of its
-/// own cannot be reached by accident.
-template <typename Lock>
-concept OptionRequired = requires(Lock *lock) { lockdep_option_required(lock); };
 
 using IrqSave = SavedStateContainer<SavedStateOption::IrqSave>;
 using PreemptDisable = SavedStateContainer<SavedStateOption::PreemptDisable>;

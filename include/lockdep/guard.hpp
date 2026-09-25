@@ -6,7 +6,7 @@
 #include <lockdep/config.hpp>
 #include <lockdep/lock_class.hpp>
 #include <lockdep/lock_context.hpp>
-#include <lockdep/state_saver.hpp>
+#include <lockdep/lock_policy.hpp>
 
 #include <tuple>
 #include <utility>
@@ -54,9 +54,29 @@ namespace priv {
         auto set(::lockdep::LockContext *) -> void {}
     };
 
+    /// The policy a Guard holds its lock with, or DefaultLockPolicy standing in
+    /// once the Guard's own assertion has already reported that there is none
+    /// -- so a missing policy is reported once, rather than again by every
+    /// member that names it.
+    template <typename Lock, typename Option>
+    struct PolicyOrStandIn {
+        using Type = DefaultLockPolicy;
+    };
+
+    template <typename Lock, typename Option>
+        requires HasPolicy<Lock, Option>
+    struct PolicyOrStandIn<Lock, Option> {
+        using Type = PolicyFor<Lock, Option>;
+    };
+
 } // namespace priv
 
-/// The RAII object to help us easier to use custom lock features.
+/// Holds one lock for one scope, the way the lock's policy says to hold it.
+///
+/// |Option| selects the policy: `Guard<SpinLock, IrqSave>` holds the lock
+/// with interrupts saved and disabled, `Guard<Mutex>` with nothing around it.
+/// See lock_policy.hpp for how the pair is resolved, and for the order in
+/// which the policy and the validator take turns.
 ///
 /// A scoped capability, so that clang's thread-safety analysis sees the lock
 /// taken here: without TA_SCOPED_CAPABILITY on this class every TA_REQUIRES
@@ -64,73 +84,75 @@ namespace priv {
 /// that was never held" -- the annotations were pure documentation until this
 /// was added. Mirrors Zircon's lockdep::Guard, which is __TA_SCOPED_CAPABILITY
 /// with __TA_ACQUIRE on the constructor and __TA_RELEASE on Release().
-template <typename LockType, typename... Options>
+template <typename LockType, typename Option = NoOption>
 class TA_SCOPED_CAPABILITY Guard {
     using Self = Guard;
 
-    static_assert((IsSavedStateContainerV<Options> && ...),
-                  "Guard options must be lockdep state tags (lockdep::IrqSave, "
-                  "lockdep::PreemptDisable, lockdep::IrqSaveAndPreemptDisable); an "
-                  "unrelated empty struct of the same name saves no state at all");
-
-    /// The deduction guide turns `Guard guard{lock}` into Guard<Lock> with an
-    /// empty saver tuple, which for a spin lock is a lock that disables
-    /// nothing. That spelling looks exactly like a correct one, so it has to
-    /// fail here rather than at run time, where it surfaced as a thread
-    /// preempted inside PmZone's critical section and the next thread on the
-    /// same CPU spinning on the lock it still held. Zircon's Guard carries the
-    /// same assertion against AmbiguousOption.
-    static_assert(sizeof...(Options) > 0 || !OptionRequired<LockType>,
+    /// `Guard guard{lock}` deduces Guard<Lock>, which for a spin lock is a lock
+    /// held with interrupts and preemption both enabled -- and the spelling
+    /// looks exactly like a correct one. It has to fail here rather than at run
+    /// time, where it surfaced as a thread preempted inside PmZone's critical
+    /// section and the next thread on the same CPU spinning on the lock it
+    /// still held. Zircon's Guard carries the same assertion against
+    /// AmbiguousOption. Checked before the general one below, so that this
+    /// case gets the message that says what to write instead.
+    static_assert(!std::is_same_v<Option, NoOption> || !OptionRequired<LockType>,
                   "this lock must be guarded with an option: Guard<Lock, lockdep::IrqSave> "
                   "(or IrqSaveAndPreemptDisable where the scope may reschedule); without one "
                   "the Guard holds it with interrupts and preemption both enabled");
 
+    /// An option the lock has no policy for. This is also how a look-alike tag
+    /// is caught -- an empty struct named IrqSave declared outside lockdep,
+    /// which is what ours::IrqSave used to be -- since no lock declares a
+    /// policy for it.
+    static_assert(HasPolicy<LockType, Option> ||
+                      (std::is_same_v<Option, NoOption> && OptionRequired<LockType>),
+                  "no lock policy for this lock and option: the lock type must declare "
+                  "lockdep_policy(Lock *, Option *) -- or a state saver -- for it");
+
+    using Policy = typename priv::PolicyOrStandIn<LockType, Option>::Type;
+
+    static_assert(LockPolicy<Policy, LockType>,
+                  "a lock policy must provide State, ValidationGuard, pre_validate(), "
+                  "acquire() returning bool, and release()");
+
   public:
     using Lock = LockType;
 
-    /// |Options| are the SavedStateContainer tags from state_saver.hpp --
-    /// IrqSave, PreemptDisable and so on. Each one names a state-saving RAII
-    /// object through StateSaver<Lock, Option>, and this constructor's job is
-    /// to have all of them alive before the lock is taken.
-    ///
-    /// The sequencing falls out of the language and is worth spelling out,
-    /// because getting it backwards is a self-deadlock rather than a
-    /// slowdown. Members are initialised before the constructor body runs, so
-    /// every saver is constructed -- interrupts off, preemption held --
-    /// *before* m_lock.acquire(). On the way out the destructor body runs
-    /// first, releasing the lock, and only then are the members destroyed, so
-    /// interrupts come back *after* the lock is dropped. SpinLock's own
-    /// acquire_irq_save()/release_irq_restore() pair documents the same
-    /// ordering constraint: restoring first leaves a window where an
-    /// interrupt on this CPU can reach for the lock this CPU still holds.
-    Guard(Lock &lock) TA_ACQUIRE(lock)
-        : m_savers(), m_lock(lock), m_entry(DefaultLockClass<Lock>::id()), m_unlocked(false) {
+    Guard(Lock &lock) TA_ACQUIRE(lock) : m_lock(lock), m_entry(DefaultLockClass<Lock>::id()) {
         this->guard();
     }
 
-    /// Tag-object form, `Guard guard{lock, IRQ_SAVE}`. The deduction guide
-    /// below has always turned that spelling into Guard<Lock, IrqSave>, but
-    /// no constructor accepted the tag, so it never compiled. The tags carry
-    /// no data; they only let the option be written at the call site.
+    /// Tag-object form, `Guard guard{lock, IRQ_SAVE}`, which the deduction
+    /// guide below turns into Guard<Lock, IrqSave>. The tag carries no data;
+    /// it only lets the option be written at the call site.
     ///
-    /// A constrained template rather than a plain `Guard(Lock &, Options...)`
-    /// for two reasons. With no options that plain form is the constructor
-    /// above a second time; and a trailing requires-clause, the obvious way to
+    /// A constrained template rather than a plain `Guard(Lock &, Option)`,
+    /// because with no option that plain form would take a NoOption the
+    /// caller never wrote; and a trailing requires-clause, the obvious way to
     /// rule that out, cannot follow the GNU attribute TA_ACQUIRE expands to,
     /// while the attribute cannot move in front of the declarator because it
     /// names the parameter.
-    template <typename... Tags>
-        requires(sizeof...(Tags) > 0 && std::is_same_v<std::tuple<Tags...>, std::tuple<Options...>>)
-    Guard(Lock &lock, Tags...) TA_ACQUIRE(lock) : Guard(lock) {}
+    template <typename Tag>
+        requires(!std::is_same_v<Option, NoOption> && std::is_same_v<Tag, Option>)
+    Guard(Lock &lock, Tag) TA_ACQUIRE(lock) : Guard(lock) {}
 
     ~Guard() TA_RELEASE() {
         unlock();
     }
 
+    /// Releases the lock before the end of the scope.
+    ///
+    /// The policy restores what it saved at this point, not when the guard is
+    /// destroyed: after `guard.unlock()` the CPU is back in the state it was
+    /// in before the guard, as with Zircon's Guard::Release(). Keeping
+    /// interrupts disabled until the end of the scope instead would leave a
+    /// stretch of code that holds no lock yet still runs with interrupts off,
+    /// which nothing in its text says.
     TA_RELEASE() auto unlock() -> void {
-        if (!m_unlocked) {
+        if (m_held) {
             release_lock();
-            m_unlocked = true;
+            m_held = false;
         }
     }
 
@@ -143,16 +165,26 @@ class TA_SCOPED_CAPABILITY Guard {
     /// held lives in this guard, on this stack frame; leaving it on the
     /// context's list would leave the list pointing into a frame that is
     /// about to be abandoned.
+    ///
+    /// The policy is not asked to release, so what it saved stays saved until
+    /// the guard itself is destroyed -- the new owner releases the lock, and
+    /// the state belongs to the frame that saved it.
     TA_RELEASE() auto unguard() -> void {
-        if (!m_unlocked) {
+        if (m_held) {
             unregister();
-            m_unlocked = true;
+            m_held = false;
         }
     }
 
+    /// Whether the guard holds its lock: false after unlock() or unguard(),
+    /// and after a try-lock policy failed to acquire.
     [[nodiscard]]
     auto held() const -> bool {
-        return !m_unlocked;
+        return m_held;
+    }
+
+    explicit operator bool() const {
+        return m_held;
     }
 
   private:
@@ -165,56 +197,57 @@ class TA_SCOPED_CAPABILITY Guard {
     /// constructor as leaving `m_lock` held and unlock() as releasing a lock
     /// that was never acquired.
     ///
-    /// The acquisition is registered before the lock is taken, so that a
-    /// report about an acquisition that is about to deadlock can name it.
+    /// The order is Zircon's ValidateAndAcquire(): the policy prepares, the
+    /// acquisition is recorded, then the lock is taken -- recorded before it
+    /// is taken so that a report about an acquisition that is about to
+    /// deadlock can name it. When a try-lock fails, the record is withdrawn;
+    /// undoing whatever pre_validate() did is the policy's own business, as
+    /// in Zircon.
     TA_NO_THREAD_SAFETY_ANALYSIS auto guard() -> void {
+        Policy::pre_validate(m_lock, m_state);
+        record();
+        if (Policy::acquire(m_lock, m_state)) {
+            m_held = true;
+            return;
+        }
+        unregister();
+    }
+
+    /// The record goes before the lock does, in the order Zircon's
+    /// Guard::Release() documents: releasing may re-enable interrupts, and a
+    /// handler that then takes the same lock must not find it still recorded
+    /// as held here.
+    TA_NO_THREAD_SAFETY_ANALYSIS auto release_lock() -> void {
+        unregister();
+        Policy::release(m_lock, m_state);
+    }
+
+    auto record() -> void {
         if constexpr (LOCK_VALIDATION_ENABLED) {
+            typename Policy::ValidationGuard const validation_guard{};
             m_context.set(current_lock_context());
             if (auto *context = m_context.get()) {
                 context->acquire(m_entry);
             }
         }
-        m_lock.acquire();
-    }
-
-    /// Unregistered before the lock is released, in the order Zircon's
-    /// Guard::Release documents: once the lock is dropped, anything that runs
-    /// on this CPU may take it again, and must not find it still recorded as
-    /// held here.
-    TA_NO_THREAD_SAFETY_ANALYSIS auto release_lock() -> void {
-        unregister();
-        m_lock.release();
     }
 
     auto unregister() -> void {
         if constexpr (LOCK_VALIDATION_ENABLED) {
             if (auto *context = m_context.get()) {
+                typename Policy::ValidationGuard const validation_guard{};
                 context->release(m_entry);
                 m_context.set(nullptr);
             }
         }
     }
 
-    /// One saver per option, in the order the options were written.
-    ///
-    /// std::tuple destroys its elements in reverse, which is the order that
-    /// matters for `Guard<SpinLock, IrqSave, PreemptDisable>`: preemption is
-    /// re-enabled first, so any reschedule that flush releases still runs
-    /// with interrupts disabled -- the state Scheduler::reschedule_common
-    /// asserts on entry -- and interrupts are restored last.
-    ///
-    /// This used to be `std::tuple<bool, Options...>`, storing the option
-    /// *tags* themselves. The tags are empty structs and nothing ever read
-    /// them, so the options were inert: every `Guard<SpinLock, IrqSave>` in
-    /// the tree took the lock and left interrupts enabled. It surfaced as the
-    /// debug kernel stopping in Scheduler::reschedule_common on
-    /// `DEBUG_ASSERT(arch::irqs_disabled())`, reached from
-    /// Thread::Current::preempt(), whose guard was supposed to have disabled
-    /// them.
-    [[no_unique_address]]
-    std::tuple<StateSaver<LockType, Options>...> m_savers;
-
     Lock &m_lock;
+
+    /// Whatever the policy keeps while the lock is held -- the saved interrupt
+    /// state, for IrqSave.
+    [[no_unique_address]]
+    typename Policy::State m_state{};
 
     /// This acquisition's entry on the lock context's held list, and the
     /// context it went onto. Both are empty types when validation is compiled
@@ -225,9 +258,7 @@ class TA_SCOPED_CAPABILITY Guard {
     [[no_unique_address]]
     priv::ContextHolder<LOCK_VALIDATION_ENABLED> m_context;
 
-    /// Whether the lock has already been handed off -- by unlock() or by
-    /// unguard() -- so the destructor knows to leave it alone.
-    bool m_unlocked;
+    bool m_held{false};
 };
 
 template <>
@@ -244,8 +275,11 @@ class Guard<void> {
     }
 };
 
-template <typename LockType, typename... Option>
-Guard(LockType &, Option...) -> Guard<LockType, Option...>;
+template <typename LockType>
+Guard(LockType &) -> Guard<LockType>;
+
+template <typename LockType, typename Option>
+Guard(LockType &, Option) -> Guard<LockType, Option>;
 
 /// Holds several locks for one scope.
 ///

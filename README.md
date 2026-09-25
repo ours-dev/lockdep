@@ -30,26 +30,28 @@ Work is split by cost:
 ```cpp
 #include <ours/lockdep.hpp>
 
-// Interrupts really are disabled for as long as the guard is alive: the tag
-// selects the saver the lock declared, and that saver is a member of the guard.
+// The option selects the lock's policy, and the policy disables interrupts
+// before the lock is taken and restores them when it is released.
 Guard<SpinLock, IrqSave> guard{lock};
 ```
 
-A lock type opts into traits and state savers next to its own declaration:
+A lock type says how it is held, one policy per option, next to its own
+declaration -- declared, never defined, found by argument-dependent lookup:
 
 ```cpp
+auto lockdep_policy(MyLock *, lockdep::IrqSave *) -> MyIrqSavePolicy;
 LOCK_DEP_TRAITS(MyLock, lockdep::ValidationOptions::IrqSafe);
-LOCKDEP_STATE_SAVER(MyLock, lockdep::SavedStateOption::IrqSave,
-                    arch::AutoInterruptDisabler);
 ```
 
-Traits are optional: a lock that declares none gets `ValidationOptions::None`.
-A saver is not: asking a `Guard` for an option the lock declares no saver for
-does not compile, because the only other answer -- save nothing -- is the bug
-that left every `Guard<SpinLock, IrqSave>` running with interrupts enabled.
+A policy (`include/lockdep/lock_policy.hpp`) provides a `State`, a
+`ValidationGuard`, and `pre_validate()`, `acquire()` returning bool, and
+`release()`. The guard calls them in Zircon's order: prepare, record the
+acquisition, acquire; and on release, withdraw the record, then release.
+Releasing early restores what the policy saved at that point.
 
-A lock whose `acquire()` changes nothing about the running CPU -- a spin lock --
-has no safe option-less form either, and can say so:
+A lock that declares no option-less policy is held by `DefaultLockPolicy`,
+which just calls `acquire()` and `release()` -- unless it has no safe
+option-less form, and says so:
 
 ```cpp
 auto lockdep_option_required(MyLock *) -> void;   // declared, never defined
@@ -58,7 +60,16 @@ auto lockdep_option_required(MyLock *) -> void;   // declared, never defined
 `Guard<MyLock>` (which is what `Guard guard{lock}` deduces to) then fails to
 compile, and every call site has to name the state it saves. That is Zircon's
 `LOCK_DEP_POLICY_OPTION`, which leaves the lock's option-less policy ambiguous
-for the same reason.
+for the same reason. Asking for an option the lock declares nothing for does
+not compile either: the only other answer -- save nothing -- is the bug that
+left every `Guard<SpinLock, IrqSave>` running with interrupts enabled.
+
+Locks declared against the older state-saver interface
+(`LOCKDEP_STATE_SAVER`) keep working: each saver is presented as a policy that
+constructs it before the acquisition is recorded and destroys it on release.
+Nothing new should be declared that way.
+
+Traits are optional: a lock that declares none gets `ValidationOptions::None`.
 
 ## Feature levels
 
