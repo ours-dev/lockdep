@@ -71,6 +71,18 @@ class TA_SCOPED_CAPABILITY Guard {
                   "lockdep::PreemptDisable, lockdep::IrqSaveAndPreemptDisable); an "
                   "unrelated empty struct of the same name saves no state at all");
 
+    /// The deduction guide turns `Guard guard{lock}` into Guard<Lock> with an
+    /// empty saver tuple, which for a spin lock is a lock that disables
+    /// nothing. That spelling looks exactly like a correct one, so it has to
+    /// fail here rather than at run time, where it surfaced as a thread
+    /// preempted inside PmZone's critical section and the next thread on the
+    /// same CPU spinning on the lock it still held. Zircon's Guard carries the
+    /// same assertion against AmbiguousOption.
+    static_assert(sizeof...(Options) > 0 || !OptionRequired<LockType>,
+                  "this lock must be guarded with an option: Guard<Lock, lockdep::IrqSave> "
+                  "(or IrqSaveAndPreemptDisable where the scope may reschedule); without one "
+                  "the Guard holds it with interrupts and preemption both enabled");
+
   public:
     using Lock = LockType;
 

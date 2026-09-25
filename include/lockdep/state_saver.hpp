@@ -65,6 +65,33 @@ template <typename Lock, typename Option>
 using StateSaver =
     decltype(lockdep_get_state_saver(static_cast<Lock *>(nullptr), static_cast<Option *>(nullptr)));
 
+/// Whether a Guard on |Lock| has to name at least one option.
+///
+/// A lock opts in by declaring -- never defining -- an overload next to its
+/// own type, found by argument-dependent lookup exactly as its state savers
+/// are:
+///
+///     auto lockdep_option_required(MyLock *) -> void;
+///
+/// It is for a lock whose acquire() changes nothing about the running CPU, so
+/// that holding it safely depends entirely on a saver. A spin lock is the
+/// case in point: a `Guard<SpinLock>` with no option holds it with interrupts
+/// and preemption both enabled, and the holder can be preempted -- or
+/// interrupted by a handler that wants the same lock -- while the next thing
+/// to run on that CPU spins on it for ever. Such a lock has no safe default,
+/// so the only answer is to make the caller say which state it saves.
+///
+/// Zircon reaches the same place by another road: LOCK_DEP_POLICY_OPTION in
+/// lock_policy.h declares the lock's `void` option as AmbiguousOption, and
+/// Guard's static_assert refuses it. The `void` spelling does not carry over
+/// to StateSaver, which looks an option up through a pointer to it: a void*
+/// parameter would also catch every option tag the lock declares no saver
+/// for, through the implicit T* -> void* conversion, and quietly resolve it
+/// to this marker instead of failing to compile. A hook with a name of its
+/// own cannot be reached by accident.
+template <typename Lock>
+concept OptionRequired = requires(Lock *lock) { lockdep_option_required(lock); };
+
 using IrqSave = SavedStateContainer<SavedStateOption::IrqSave>;
 using PreemptDisable = SavedStateContainer<SavedStateOption::PreemptDisable>;
 using IrqSaveAndPreemptDisable = SavedStateContainer<SavedStateOption::IrqSaveAndPreemptDisable>;
