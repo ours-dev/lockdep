@@ -423,6 +423,19 @@ class ScopedGuard {
         }
     }
 
+    /// Tag-object form, `ScopedGuard guard{IRQ_SAVE, a, b}`, the counterpart
+    /// of `Guard guard{lock, IRQ_SAVE}`. The tag leads where Guard's trails,
+    /// because a pack that is not the last parameter is never deduced: behind
+    /// the locks, the tag would leave them undeducible. That is also where
+    /// std::scoped_lock puts adopt_lock_t, while std::lock_guard, holding one
+    /// lock, puts it last. Constrained as Guard's tag form is, so that a guard
+    /// with no option does not take a NoOption the caller never wrote.
+    template <typename Tag, typename... Locks>
+        requires(!std::is_same_v<Option, NoOption> && std::is_same_v<Tag, Option> &&
+                 sizeof...(Locks) == Count && (std::is_same_v<Locks, Lock<LockType>> && ...))
+    TA_NO_THREAD_SAFETY_ANALYSIS explicit ScopedGuard(Tag, Locks &...locks)
+        : ScopedGuard(locks...) {}
+
     /// Released in the reverse of the acquisition order, highest address
     /// first. The array's own destruction runs in that order too.
     TA_NO_THREAD_SAFETY_ANALYSIS ~ScopedGuard() {
@@ -469,6 +482,23 @@ class ScopedGuard {
     /// construct each in place, where Zircon uses a union.
     std::optional<Guard<LockType, Option>> m_guards[Count];
 };
+
+/// The count, the lock type and the option are all read off the arguments,
+/// as std::scoped_lock reads its lock types off its own: `ScopedGuard
+/// guard{a, b}` is a ScopedGuard<2, T>. Deduction is all or nothing -- once
+/// any template argument is written, none is deduced -- so an option cannot
+/// be spelled as one next to a deduced count, and travels as a tag instead.
+template <typename LockType, typename... Locks>
+ScopedGuard(Lock<LockType> &, Locks &...) -> ScopedGuard<1 + sizeof...(Locks), LockType>;
+
+/// `ScopedGuard guard{IRQ_SAVE, a, b}` is a ScopedGuard<2, T, IrqSave>.
+/// Constrained to an option the lock type has a policy for: unconstrained,
+/// this guide would also read `guard{a, b}` as a tag followed by one lock,
+/// and the two guides would be ambiguous.
+template <typename Option, typename LockType, typename... Locks>
+    requires HasPolicy<LockType, Option>
+ScopedGuard(Option, Lock<LockType> &, Locks &...)
+    -> ScopedGuard<1 + sizeof...(Locks), LockType, Option>;
 
 } // namespace lockdep
 

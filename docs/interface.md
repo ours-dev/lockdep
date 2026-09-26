@@ -357,15 +357,31 @@ nestable lock needs them.
 template <usize Count, typename LockType, typename Option = NoOption>
 class ScopedGuard {
   public:
-    explicit ScopedGuard(Lock<LockType> &...locks);   // Count of them, of one class
+    explicit ScopedGuard(Lock<LockType> &...locks);           // Count of them, of one class
+    explicit ScopedGuard(Option, Lock<LockType> &...locks);   // the same, option as a tag
     auto release() -> void;
     explicit operator bool() const;
 };
+
+ScopedGuard guard{a, b};             // ScopedGuard<2, T>
+ScopedGuard guard{IRQ_SAVE, a, b};   // ScopedGuard<2, T, IrqSave>
 ```
 
 Takes the locks in address order, so any two sites locking the same set agree
 on the order. Locks of *different* classes are simply nested `Guard`s, whose
 order is exactly what lockdep is there to check.
+
+The count is deduced from the arguments, as `std::scoped_lock` deduces its
+lock types. Class template argument deduction is all or nothing -- once any
+template argument is written, none is deduced -- so the option cannot be
+written as one beside a deduced count and is passed as a tag instead, as in
+`Guard guard{lock, IRQ_SAVE}`. The tag leads here where Guard's trails: a pack
+that is not the last parameter is never deduced, which is also why
+`std::scoped_lock` takes `adopt_lock_t` first and `std::lock_guard` last. The
+tagged deduction guide only accepts an option the lock type has a policy for;
+without that, `ScopedGuard guard{a, b}` could be read as a tag and one lock,
+and the two guides would be ambiguous. The explicit form,
+`ScopedGuard<2, T, IrqSave> guard{a, b}`, still works.
 
 The name is `std::scoped_lock`'s, the standard's guard over several locks; the
 algorithm is not. `std::scoped_lock` avoids deadlock through `std::lock`: take
@@ -549,7 +565,7 @@ itself; `system_init_thread_lock_state` is left out, as a default-constructed
 - `Thread` holds a `ThreadLockState`; each CPU's local data holds another.
 - The variadic `ScopedGuard` is gone. A call site over locks of different
   classes becomes nested `Guard`s, one over several locks of one class a
-  `ScopedGuard<N, T, Option>`. The kernel has no call sites, only the
+  `ScopedGuard{IRQ_SAVE, a, b}`. The kernel has no call sites, only the
   re-export in `ours/lockdep.hpp`, which now names the new guard, and a
   comment in `Scheduler::tick_thread` that still describes the old one.
 
