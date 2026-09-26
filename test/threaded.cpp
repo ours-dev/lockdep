@@ -188,8 +188,8 @@ auto survives_concurrent_recording() -> bool {
     }
 
     // The edge is recorded once no matter how many threads raced to add it.
-    auto *stress = lockdep::ValidatorLockClassState::from_id(ClassOf<OwnerStress>::id());
-    auto *target = lockdep::ValidatorLockClassState::from_id(ClassOf<OwnerC>::id());
+    auto *stress = lockdep::LockClassState::from_id(ClassOf<OwnerStress>::id());
+    auto *target = lockdep::LockClassState::from_id(ClassOf<OwnerC>::id());
     if (stress == nullptr || target == nullptr) {
         std::printf("    classes did not register\n");
         return false;

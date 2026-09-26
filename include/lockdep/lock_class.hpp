@@ -8,6 +8,7 @@
 #include <lockdep/lock_traits.hpp>
 #include <lockdep/types.hpp>
 
+#include <type_traits>
 #include <utility>
 
 #include <ours/compiler.hpp>
@@ -17,9 +18,20 @@ namespace priv {
     template <bool Enabled, typename Class, typename Lock, usize Index, ValidationOptions Options>
     class LockClassStateStorage;
 
+    /// The name a class is reported by: its owner or tag, or, for the class
+    /// a bare lock falls back to, the lock type itself.
+    template <typename Class, typename Lock>
+    constexpr auto class_name() -> char const * {
+        if constexpr (std::is_void_v<Class>) {
+            return TypeName<Lock>::VALUE;
+        } else {
+            return TypeName<Class>::VALUE;
+        }
+    }
+
     template <typename Class, typename Lock, usize Index, ValidationOptions Options>
     class LockClassStateStorage<true, Class, Lock, Index, Options> {
-        using State = IfLockValidationEnabled<ValidatorLockClassState, MetadataLockClassState>;
+        using State = LockClassState;
 
       public:
         /// Used to be declared and never defined, so the first caller would
@@ -39,7 +51,7 @@ namespace priv {
         /// rather than defined out of line: every translation unit must agree
         /// on it. Zircon's LockClassStateStorage::lock_class_state_ in
         /// lockdep/lock_class.h plays the same dual role.
-        static inline State m_lock_class_state{Options};
+        static inline State m_lock_class_state{class_name<Class, Lock>(), Options};
     };
 
     template <typename Class, typename Lock, usize Index, ValidationOptions Options>
@@ -54,10 +66,12 @@ namespace priv {
 
 /// Names a lock class. |Class| is the type that owns the lock, |Index|
 /// separates several locks of the same type within one owner.
+///
+/// An alias rather than, as it was, a class deriving from the storage: it
+/// added nothing to it.
 template <typename Class, typename Lock, usize Index = 0,
           ValidationOptions Options = LockValidationOptionsV<Lock>>
-class LockClass
-    : public priv::LockClassStateStorage<LOCK_METADATA_AVAILABLE, Class, Lock, Index, Options> {};
+using LockClass = priv::LockClassStateStorage<LOCK_METADATA_AVAILABLE, Class, Lock, Index, Options>;
 
 /// The class a bare lock falls back to when the acquisition site names no
 /// owner. Every lock of the same type shares it.

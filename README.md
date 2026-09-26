@@ -80,7 +80,7 @@ The level comes from the build, never from the source. `config("lockdep")` in
 | `lockdep_enable` | Level | What is compiled in |
 | --- | --- | --- |
 | unset | `Disabled` | Nothing. `Guard` is the lock reference and a flag; `LockContext` is empty. |
-| `lockdep_metadata_only` | `MetadataOnly` | Lock classes and their traits, no tracking. |
+| `lockdep_metadata_only` | `MetadataOnly` | Lock classes, with their names and options; no tracking. |
 | `true` | `Validation` | The graph, the acquire-time checks, and the detector. |
 
 At `Disabled` every lockdep member vanishes — `Guard` costs no more than a hand

@@ -13,6 +13,7 @@
 #include <lockdep/thread_lock_state.hpp>
 #include <lockdep/types.hpp>
 
+#include <string_view>
 #include <tuple>
 
 #include <cstdio>
@@ -548,6 +549,19 @@ auto guard_multiple_with_option() -> bool {
     return saved && fake::g_irq_depth == 0;
 }
 
+// A class is reported by name: a declared lock by its tag, a bare lock by its
+// type.
+auto class_names() -> bool {
+    Owner const owner;
+    std::string_view const declared = lockdep::name_of(owner.m_first.id());
+    std::string_view const bare = lockdep::name_of(lockdep::DefaultLockClass<fake::SpinLock>::id());
+    if constexpr (lockdep::LOCK_METADATA_AVAILABLE) {
+        return declared == "OwnerFirstLock" && bare == "fake::SpinLock";
+    } else {
+        return declared.empty() && bare.empty();
+    }
+}
+
 // lock() hands out the inner lock as the Lock's own capability, so taking it
 // through lock() is balanced to -Wthread-safety.
 auto annotated_through_lock() -> bool {
@@ -1029,6 +1043,7 @@ auto main() -> int {
 
     check("class_ids_are_distinct", class_ids_are_distinct());
     check("named_classes", named_classes());
+    check("class_names", class_names());
     check("annotated_through_lock", annotated_through_lock());
     check("declared_locks_nest", declared_locks_nest());
     check("write_under_guard", write_under_guard());

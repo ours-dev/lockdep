@@ -108,7 +108,7 @@ class ThreadLockState {
         if constexpr (!LOCK_VALIDATION_ENABLED) {
             return;
         }
-        auto *const acquiring = ValidatorLockClassState::from_id(entry.id());
+        auto *const acquiring = LockClassState::from_id(entry.id());
         if (acquiring == nullptr || acquiring->tracking_disabled()) {
             return;
         }
@@ -123,7 +123,7 @@ class ThreadLockState {
         acquiring->ensure_registered();
 
         for (auto &held_entry: m_acquired_locks) {
-            auto *const held = ValidatorLockClassState::from_id(held_entry.id());
+            auto *const held = LockClassState::from_id(held_entry.id());
             if (held->has(ValidationOptions::Leaf)) {
                 report(entry, &held_entry, LockResult::AcquireAfterLeaf);
             } else if (held == acquiring) {
@@ -145,7 +145,7 @@ class ThreadLockState {
         if constexpr (!LOCK_VALIDATION_ENABLED) {
             return;
         }
-        auto *const releasing = ValidatorLockClassState::from_id(entry.id());
+        auto *const releasing = LockClassState::from_id(entry.id());
         if (releasing == nullptr || releasing->tracking_disabled()) {
             return;
         }
@@ -199,7 +199,7 @@ class ThreadLockState {
     /// address. Order zero on a class that is not Nestable is the plain
     /// mistake of taking a second lock of it.
     auto check_same_class(AcquiredLockEntry const &entry, AcquiredLockEntry const &held_entry,
-                          ValidatorLockClassState const &cls) -> void {
+                          LockClassState const &cls) -> void {
         if (entry.address() == held_entry.address()) {
             report(entry, &held_entry, LockResult::Reentrance);
             return;
@@ -222,10 +222,10 @@ class ThreadLockState {
     /// orders can deadlock head on -- worth reporting here, with the offending
     /// context still on the stack, rather than waiting for a detector pass.
     auto record_edge(AcquiredLockEntry const &entry, AcquiredLockEntry const &held_entry,
-                     ValidatorLockClassState &held, ValidatorLockClassState &acquiring) -> void {
+                     LockClassState &held, LockClassState &acquiring) -> void {
         held.ensure_registered();
         switch (held.add_dependency(&acquiring)) {
-            case ValidatorLockClassState::AddResult::Added:
+            case LockClassState::AddResult::Added:
                 trigger_loop_detection();
                 if (held.has(ValidationOptions::IrqSafe) &&
                     !acquiring.has(ValidationOptions::IrqSafe)) {
@@ -235,10 +235,10 @@ class ThreadLockState {
                     report(entry, &held_entry, LockResult::OutOfOrder);
                 }
                 return;
-            case ValidatorLockClassState::AddResult::Full:
+            case LockClassState::AddResult::Full:
                 report(entry, &held_entry, LockResult::MaxLockDependencies);
                 return;
-            case ValidatorLockClassState::AddResult::Present:
+            case LockClassState::AddResult::Present:
                 return;
         }
     }
@@ -256,7 +256,7 @@ class ThreadLockState {
         }
         ++m_reporting_disabled_count;
 
-        auto const *const cls = ValidatorLockClassState::from_id(entry.id());
+        auto const *const cls = LockClassState::from_id(entry.id());
         auto const repeat =
             result == LockResult::AlreadyAcquired || result == LockResult::InvalidNesting;
         if (repeat && cls->has(ValidationOptions::ReAcquireFatal)) {

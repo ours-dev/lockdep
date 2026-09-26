@@ -54,7 +54,7 @@ file names, and `std::` facilities over ustl wrappers.
 | `lockdep/guard.hpp` | `guard.h` | `Guard`, `NullGuard`, `assert_held` |
 | `lockdep/guard_multiple.hpp` | `guard_multiple.h` | `GuardMultiple` |
 | `lockdep/thread_lock_state.hpp` | `thread_lock_state.h` | `AcquiredLockEntry`, `ThreadLockState`, `assert_no_locks_held` |
-| `lockdep/lock_class_state.hpp` | `lock_class_state.h` | the graph node and `loop_detection_pass()` |
+| `lockdep/lock_class_state.hpp` | `lock_class_state.h` | `LockClassState`, the graph node, `loop_detection_pass()` |
 | `lockdep/runtime_api.hpp` | `runtime_api.h` | what the environment must define |
 | `lockdep/lockdep.hpp` | `lockdep.h` | umbrella |
 
@@ -432,19 +432,44 @@ while still listed, which is Zircon's `!InContainer()` assertion.
 `LockContext` is the name the kernel's `Thread` member was declared with; it
 stays as the alias that collapses to an empty type without validation.
 
-## Graph — `lock_class_state.hpp`
+## Lock class state and graph — `lock_class_state.hpp`
 
 ```cpp
-class ValidatorLockClassState {
+class LockClassState {                           // its address is the class id
   public:
-    auto has_dependency(Self const *) const -> bool;
-    auto add_dependency(Self *) -> AddResult;   // Added, Present, Full
-    ...
+    constexpr LockClassState(char const *name, ValidationOptions options);
+    static auto from_id(LockClassId) -> LockClassState *;
+    auto name() const -> char const *;          // the tag, or the bare lock's type
+    auto options() const -> ValidationOptions;
+    // The graph; no-ops where validation is compiled out:
+    auto ensure_registered() -> void;
+    auto has_dependency(LockClassState const *) const -> bool;
+    auto add_dependency(LockClassState *) -> AddResult;   // Added, Present, Full
+  private:
+    char const *m_name;
+    ValidationOptions m_options;
+    [[no_unique_address]] Graph m_graph;         // GraphNode, or an empty stand-in
 };
 
 auto options_of(LockClassId) -> ValidationOptions;
+auto name_of(LockClassId) -> char const *;
 auto loop_detection_pass() -> usize;             // cycles found, each reported once
 ```
+
+One class holding its parts as members, where Zircon chains `LockClassState`
+→ `MetadataLockClassState` → `ValidatorLockClassState` through inheritance and
+picks the most derived one per feature level. Composition is this repository's
+default, and it leaves nothing to downcast: the chain had every reader cast a
+`LockClassId` to whichever level it assumed. Where validation is compiled out
+the graph node is an empty stand-in with the same interface, so the acquire
+path is written once and compiles at every level; the detector, which reads
+the real node's scratch space, is a template instantiated only where there is
+a real node.
+
+The name is the tag type's, taken from `__PRETTY_FUNCTION__` at compile time
+into a null-terminated array -- Zircon's `LockNameHelper` does the same for its
+class and line. It is what makes the metadata-only level worth having: a
+report can say `ThreadPiLock` instead of an address.
 
 An edge held → new is stored in the held class's set, its successors; Zircon
 stores the same edge in the new class's set, its predecessors. Either works;
@@ -458,10 +483,8 @@ iterative, with its scratch state in the nodes. It reports each cycle once,
 through `system_circular_lock_dependency_detected()`, naming the component's
 root as Zircon's detector does.
 
-Still to come: the metadata and validator parts as members selected by the
-feature level rather than Zircon's inheritance chain, and the dependency set
-as Zircon's lock-free open-addressed hash set (`lock_dependency_set.h`) instead
-of a linear array.
+Still to come: the dependency set as Zircon's lock-free open-addressed hash
+set (`lock_dependency_set.h`) instead of a linear array.
 
 ## Environment — `runtime_api.hpp`
 
