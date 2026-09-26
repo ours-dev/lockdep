@@ -290,6 +290,7 @@ template <typename LockType, typename Option = NoOption>
 class Guard {
   public:
     explicit Guard(Lock<LockType> &lock);       // recorded under the declared class
+    Guard(Lock<LockType> &lock, LockOrder);     // at an order among locks of its class
     Guard(LockType &lock);                      // transitional: DefaultLockClass<LockType>
     Guard(Lock<LockType> &lock, Option);        // tag-object form, Guard guard{lock, IRQ_SAVE}
 
@@ -318,13 +319,18 @@ trailing return types only a member can name its object (`TA_ASSERT()`, meaning
 `assert_held()` does the runtime check; a lock type without one cannot be
 asserted on.
 
-Still to come, after `ThreadLockState` (they depend on it):
+`LockOrder` is a strong type rather than Zircon's bare `uintptr_t`, so that the
+ordered form `Guard guard{lock, LockOrder{2}}` cannot be mistaken for the
+option-tag form `Guard guard{lock, IRQ_SAVE}`. The validator requires the
+orders of locks of one class held together to rise; a `Nestable` class only
+changes what a second lock at order zero is reported as.
 
-- `take()` and `Guard(AdoptLock, Lock<LockType> &, Adoptable &&)`, which move a
-  held lock's record to another scope. That means replacing a node in the
-  held-lock list in place, O(1) only once the list is doubly linked.
-- The nestable constructor `Guard(Lock<LockType> &, usize order)`, whose order
-  the validator has to compare against the held entry of the same class.
+Still to come: `take()` and `Guard(AdoptLock, Lock<LockType> &, Adoptable &&)`,
+which move a held lock to another scope. The held list is now doubly linked,
+so moving its record is O(1); what remains is the policy's `State`. A state
+saver adapted into a policy keeps an RAII object there, and moving that would
+restore the saved state early -- so adoption has to be limited to policies
+whose state is plain data, as every Zircon policy's is.
 
 The acquire sequence is Zircon's `ValidateAndAcquire`, and its order is the
 point of the policy split:
@@ -346,10 +352,10 @@ nestable lock needs them.
 ## Several locks of one class — `guard_multiple.hpp`
 
 ```cpp
-template <usize N, typename LockType, typename Option = NoOption>
+template <usize Count, typename LockType, typename Option = NoOption>
 class GuardMultiple {
   public:
-    explicit GuardMultiple(std::array<Lock<LockType> *, N> locks);  // all of one class
+    explicit GuardMultiple(Lock<LockType> &...locks);   // Count of them, of one class
     auto release() -> void;
     explicit operator bool() const;
 };
@@ -359,10 +365,12 @@ Takes the locks in address order, so any two sites locking the same set agree
 on the order. Replaces `ScopedGuard`; locks of *different* classes are simply
 nested `Guard`s, whose order is exactly what lockdep is there to check.
 
-It lands after `ThreadLockState`. Two locks of one class held together read as
-a re-acquisition unless each record carries an order -- the address, here --
-and the validator checks that the orders rise, as Zircon's
-`ThreadLockState::Acquire()` does with `AcquiredLockEntry::order()`.
+Each lock is held by an ordered `Guard` whose `LockOrder` is its address, so
+the validator sees one class held several times with rising orders -- no
+violation -- exactly as Zircon's `GuardMultiple` uses `OrderedLock`. The
+guards are built in place in a `std::optional` each, where Zircon uses a
+union, and released highest address first. A `Nestable` lock type is refused,
+as in Zircon: its own orders and the address order are unrelated sequences.
 
 ## Per-context state — `thread_lock_state.hpp`
 

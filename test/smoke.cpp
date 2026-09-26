@@ -118,6 +118,18 @@ struct TA_CAPABILITY("mutex") AnnotatedLock {
 };
 LOCKDEP_STATE_SAVER(AnnotatedLock, lockdep::SavedStateOption::IrqSave, AutoInterruptDisabler);
 
+// Records the order its instances are acquired in.
+inline void const *g_sequence[8]{};
+inline int g_sequence_length = 0;
+
+struct SequencedLock {
+    auto acquire() -> void {
+        g_sequence[g_sequence_length] = this;
+        ++g_sequence_length;
+    }
+    auto release() -> void {}
+};
+
 // A lock that declares policies of its own, the way the kernel's locks are
 // meant to, including a try-lock that can fail.
 struct PolicyLock {
@@ -458,6 +470,82 @@ auto call_untracked_keeps_the_lock(fake::SpinLock &lock) -> bool {
     } else {
         return inside && lock.held;
     }
+}
+
+// Ordered and multiple guards.
+
+// Two locks of one Nestable class: one declaration's tag, so one class.
+struct Tree {
+    lockdep::Lock<fake::BareLock> m_parent{
+        lockdep::lock_class<struct TreeNode, lockdep::ValidationOptions::Nestable>()};
+    lockdep::Lock<fake::BareLock> m_child{
+        lockdep::lock_class<struct TreeNode, lockdep::ValidationOptions::Nestable>()};
+};
+
+auto ordered_guards() -> bool {
+    Tree tree;
+    reset_reports();
+    {
+        lockdep::Guard parent{tree.m_parent, lockdep::LockOrder{1}};
+        lockdep::Guard child{tree.m_child, lockdep::LockOrder{2}};
+        static_assert(std::is_same_v<decltype(child), lockdep::Guard<fake::BareLock>>,
+                      "an ordered Guard over Lock<T> is a Guard<T>");
+    }
+    auto const rising = g_report_count == 0;
+    {
+        lockdep::Guard parent{tree.m_parent, lockdep::LockOrder{2}};
+        lockdep::Guard child{tree.m_child, lockdep::LockOrder{1}};
+    }
+    if constexpr (lockdep::LOCK_VALIDATION_ENABLED) {
+        return rising && reports_of(lockdep::LockResult::InvalidNesting) == 1;
+    } else {
+        return rising && g_report_count == 0;
+    }
+}
+
+// Three locks of one class, as a GuardMultiple sees them.
+struct Buckets {
+    lockdep::Lock<fake::SequencedLock> m_first{lockdep::lock_class<struct Bucket>()};
+    lockdep::Lock<fake::SequencedLock> m_second{lockdep::lock_class<struct Bucket>()};
+    lockdep::Lock<fake::SequencedLock> m_third{lockdep::lock_class<struct Bucket>()};
+};
+
+// Taken in address order whatever order they are given in, so two call sites
+// listing the same locks differently agree -- and the validator sees one class
+// held three times with rising orders, which is no violation.
+auto guard_multiple_takes_address_order() -> bool {
+    Buckets buckets;
+    reset_reports();
+    fake::g_sequence_length = 0;
+    auto all_held = false;
+    {
+        lockdep::GuardMultiple<3, fake::SequencedLock> guard{buckets.m_third, buckets.m_first,
+                                                             buckets.m_second};
+        all_held = static_cast<bool>(guard);
+    }
+    auto const ascending = fake::g_sequence_length == 3 &&
+                           fake::g_sequence[0] < fake::g_sequence[1] &&
+                           fake::g_sequence[1] < fake::g_sequence[2];
+    {
+        lockdep::GuardMultiple<3, fake::SequencedLock> guard{buckets.m_second, buckets.m_third,
+                                                             buckets.m_first};
+    }
+    return all_held && ascending && g_report_count == 0 && !recorded();
+}
+
+// The option applies to each lock: every saver is held while the group is.
+auto guard_multiple_with_option() -> bool {
+    struct Pair {
+        lockdep::Lock<fake::SpinLock> m_left{lockdep::lock_class<struct PairLock>()};
+        lockdep::Lock<fake::SpinLock> m_right{lockdep::lock_class<struct PairLock>()};
+    } pair;
+    auto saved = false;
+    {
+        lockdep::GuardMultiple<2, fake::SpinLock, lockdep::IrqSave> guard{pair.m_left,
+                                                                          pair.m_right};
+        saved = fake::g_irq_depth == 2;
+    }
+    return saved && fake::g_irq_depth == 0;
 }
 
 // lock() hands out the inner lock as the Lock's own capability, so taking it
@@ -947,6 +1035,9 @@ auto main() -> int {
     check("assert_held_checks", assert_held_checks());
     check("call_unlocked_drops_and_retakes", call_unlocked_drops_and_retakes(a));
     check("call_untracked_keeps_the_lock", call_untracked_keeps_the_lock(a));
+    check("ordered_guards", ordered_guards());
+    check("guard_multiple_takes_address_order", guard_multiple_takes_address_order());
+    check("guard_multiple_with_option", guard_multiple_with_option());
     check("plain_guard", plain_guard(a));
     check("irq_guard", irq_guard(a));
     check("combined_guard", combined_guard(a));

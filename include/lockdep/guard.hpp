@@ -10,6 +10,7 @@
 #include <lockdep/runtime_api.hpp>
 #include <lockdep/thread_lock_state.hpp>
 
+#include <optional>
 #include <tuple>
 #include <utility>
 
@@ -76,6 +77,18 @@ namespace priv {
 
 } // namespace priv
 
+/// The rank of a lock among the locks of its class held together.
+///
+/// Two locks of one class held at once read to the validator as a mistake
+/// unless the second one's order rises above the first's. A Nestable class
+/// supplies the order itself -- a depth in a tree, say -- and GuardMultiple
+/// uses the locks' addresses. A strong type rather than a bare integer, so
+/// that `Guard guard{lock, LockOrder{2}}` cannot be confused with the
+/// option-tag form `Guard guard{lock, IRQ_SAVE}`.
+struct LockOrder {
+    usize value;
+};
+
 /// Holds one lock for one scope, the way the lock's policy says to hold it.
 ///
 /// |Option| selects the policy: `Guard<SpinLock, IrqSave>` holds the lock
@@ -129,6 +142,15 @@ class TA_SCOPED_CAPABILITY Guard {
     /// guarded by: TA_GUARDED(m_pi_lock) with m_pi_lock the Lock.
     explicit Guard(::lockdep::Lock<LockType> &lock) TA_ACQUIRE(lock)
         : m_lock(lock.lock()), m_entry(&lock.lock(), lock.id()) {
+        this->guard();
+    }
+
+    /// Takes a lock of a class that may be held more than once, at |order|
+    /// among the locks of that class this context holds: the orders have to
+    /// rise, or the validator reports InvalidNesting. Zircon's ordered Guard
+    /// constructor.
+    Guard(::lockdep::Lock<LockType> &lock, LockOrder const order) TA_ACQUIRE(lock)
+        : m_lock(lock.lock()), m_entry(&lock.lock(), lock.id(), order.value) {
         this->guard();
     }
 
@@ -343,6 +365,9 @@ class Guard<void> {
 template <typename LockType>
 Guard(Lock<LockType> &) -> Guard<LockType>;
 
+template <typename LockType>
+Guard(Lock<LockType> &, LockOrder) -> Guard<LockType>;
+
 template <typename LockType, typename Option>
 Guard(Lock<LockType> &, Option) -> Guard<LockType, Option>;
 
@@ -351,6 +376,90 @@ Guard(LockType &) -> Guard<LockType>;
 
 template <typename LockType, typename Option>
 Guard(LockType &, Option) -> Guard<LockType, Option>;
+
+/// Holds |Count| locks of one class at once, taking them in address order.
+///
+/// Two locks of one class held together are ordered by address, so any two
+/// sites that lock the same set agree on the order however they list it --
+/// which is what makes holding several of one class safe at all. Each lock is
+/// held by a Guard whose LockOrder is its address, so the validator checks
+/// the order rises. Zircon's GuardMultiple (lockdep/guard_multiple.h).
+///
+/// Meant for locks of one class. Locks of different classes are nested Guards,
+/// whose order is exactly what the validator is there to check; given here,
+/// they are taken in address order and validated as such.
+template <usize Count, typename LockType, typename Option = NoOption>
+class GuardMultiple {
+    using Self = GuardMultiple;
+
+    static_assert(Count > 0, "GuardMultiple needs at least one lock");
+
+    /// The same restriction as Zircon's: a Nestable class orders its locks
+    /// itself, and mixing that order with the address order would compare two
+    /// unrelated sequences.
+    static_assert(!priv::has_option(LockValidationOptionsV<LockType>, ValidationOptions::Nestable),
+                  "a Nestable lock type is ordered by its own orders, not by GuardMultiple");
+
+  public:
+    /// Excluded from the thread-safety analysis, as Zircon's GuardMultiple is:
+    /// the locks are held by Guards built inside std::optional, where the
+    /// analysis cannot follow them.
+    template <typename... Locks>
+        requires(sizeof...(Locks) == Count && (std::is_same_v<Locks, Lock<LockType>> && ...))
+    TA_NO_THREAD_SAFETY_ANALYSIS explicit GuardMultiple(Locks &...locks) {
+        Lock<LockType> *sorted[Count] = {&locks...};
+        sort_by_address(sorted);
+        for (usize i = 0; i < Count; ++i) {
+            m_guards[i].emplace(*sorted[i], LockOrder{reinterpret_cast<usize>(sorted[i])});
+        }
+    }
+
+    /// Released in the reverse of the acquisition order, highest address
+    /// first. The array's own destruction runs in that order too.
+    TA_NO_THREAD_SAFETY_ANALYSIS ~GuardMultiple() {
+        release();
+    }
+
+    TA_NO_THREAD_SAFETY_ANALYSIS auto release() -> void {
+        for (usize i = Count; i > 0; --i) {
+            if (m_guards[i - 1]) {
+                m_guards[i - 1]->unlock();
+            }
+        }
+    }
+
+    /// Whether every lock is held.
+    explicit operator bool() const {
+        for (auto const &guard: m_guards) {
+            if (!guard || !guard->held()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+  private:
+    USTL_NO_MOVEABLE_AND_COPYABLE(GuardMultiple);
+
+    /// Insertion sort: Count is a handful, and for two it is one compare and
+    /// swap.
+    static auto sort_by_address(Lock<LockType> *(&locks)[Count]) -> void {
+        for (usize i = 1; i < Count; ++i) {
+            auto *const lock = locks[i];
+            auto j = i;
+            while (j > 0 && locks[j - 1] > lock) {
+                locks[j] = locks[j - 1];
+                --j;
+            }
+            locks[j] = lock;
+        }
+    }
+
+    /// Guards are neither movable nor default-constructible, and have to be
+    /// constructed after sorting; an optional per slot is the plain way to
+    /// construct each in place, where Zircon uses a union.
+    std::optional<Guard<LockType, Option>> m_guards[Count];
+};
 
 /// Holds several locks for one scope.
 ///
