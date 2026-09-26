@@ -10,8 +10,9 @@ inferred: a lock's class is named by a tag type, not by Zircon's `__LINE__`
 macro; `Guard` accepts only `lockdep::Lock<T>`, with no transitional overload
 for raw locks; releasing a guard early restores what its policy saved at
 that point, as Zircon's `Guard::Release()` does, not at the end of the scope;
-and the guard over several locks of one class is called `ScopedGuard`, after
-`std::scoped_lock`, rather than Zircon's `GuardMultiple`.
+and the guard over several locks of one class is called `ScopedGuard` and
+shaped like `std::scoped_lock`, its count the size of a pack of lock types,
+rather than Zircon's `GuardMultiple` with the count as a parameter.
 
 Where the design keeps Zircon's shape the Zircon file is cited so the two can
 be compared. Where it departs, the reason is given — usually one of this
@@ -354,34 +355,47 @@ nestable lock needs them.
 ## Several locks of one class — `ScopedGuard` in `guard.hpp`
 
 ```cpp
-template <usize Count, typename LockType, typename Option = NoOption>
+template <typename Option = NoOption, typename... LockTypes>
 class ScopedGuard {
   public:
-    explicit ScopedGuard(Lock<LockType> &...locks);           // Count of them, of one class
-    explicit ScopedGuard(Option, Lock<LockType> &...locks);   // the same, option as a tag
+    explicit ScopedGuard(Lock<LockTypes> &...locks);           // all of one type
+    explicit ScopedGuard(Option, Lock<LockTypes> &...locks);   // the same, option as a tag
     auto release() -> void;
     explicit operator bool() const;
 };
 
-ScopedGuard guard{a, b};             // ScopedGuard<2, T>
-ScopedGuard guard{IRQ_SAVE, a, b};   // ScopedGuard<2, T, IrqSave>
+ScopedGuard guard{a, b};             // ScopedGuard<NoOption, T, T>
+ScopedGuard guard{IRQ_SAVE, a, b};   // ScopedGuard<IrqSave, T, T>
 ```
 
 Takes the locks in address order, so any two sites locking the same set agree
 on the order. Locks of *different* classes are simply nested `Guard`s, whose
 order is exactly what lockdep is there to check.
 
-The count is deduced from the arguments, as `std::scoped_lock` deduces its
-lock types. Class template argument deduction is all or nothing -- once any
-template argument is written, none is deduced -- so the option cannot be
-written as one beside a deduced count and is passed as a tag instead, as in
-`Guard guard{lock, IRQ_SAVE}`. The tag leads here where Guard's trails: a pack
-that is not the last parameter is never deduced, which is also why
-`std::scoped_lock` takes `adopt_lock_t` first and `std::lock_guard` last. The
-tagged deduction guide only accepts an option the lock type has a policy for;
-without that, `ScopedGuard guard{a, b}` could be read as a tag and one lock,
-and the two guides would be ambiguous. The explicit form,
-`ScopedGuard<2, T, IrqSave> guard{a, b}`, still works.
+Shaped like `std::scoped_lock`: the locks' types are the class's parameter
+pack, so the count is `sizeof...` of it, never a number the caller supplies,
+and class template argument deduction works straight from the constructors,
+with no deduction guide written by hand. Zircon's `GuardMultiple` takes the
+count as a template parameter instead; with deduction, that could only be
+filled in by guides restating what the constructor already says. The pack
+names the one lock type once per lock, and a static assertion holds them to
+it.
+
+Deduction is all or nothing -- once any template argument is written, none is
+deduced -- so the option is passed as a tag, as in
+`Guard guard{lock, IRQ_SAVE}`. The tag leads here where Guard's trails, and the
+option leads the template parameters to match: a class template's pack must
+be its last parameter, and a pack that is not the last function parameter is
+never deduced, which is also why `std::scoped_lock` takes `adopt_lock_t` first
+and `std::lock_guard` last.
+
+The tagged constructor is constrained to an option every lock type has a
+policy for, followed by at least one lock. Without that, deduction could read
+`ScopedGuard guard{a, b}` as the tag `a` and one lock, or `guard{a}` as the tag
+`a` and none, and the two constructors would be ambiguous. The constraint is
+stated over the template parameters, not over members such as the count,
+since deduction checks it for specialisations like `ScopedGuard<Lock<T>>` that
+must never be instantiated.
 
 The name is `std::scoped_lock`'s, the standard's guard over several locks; the
 algorithm is not. `std::scoped_lock` avoids deadlock through `std::lock`: take

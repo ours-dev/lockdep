@@ -515,8 +515,7 @@ struct Buckets {
 
 // Taken in address order whatever order they are given in, so two call sites
 // listing the same locks differently agree -- and the validator sees one class
-// held three times with rising orders, which is no violation. The first site
-// has its count deduced from the locks, the second spells it out.
+// held three times with rising orders, which is no violation.
 auto scoped_guard_takes_address_order() -> bool {
     Buckets buckets;
     reset_reports();
@@ -525,15 +524,16 @@ auto scoped_guard_takes_address_order() -> bool {
     {
         lockdep::ScopedGuard guard{buckets.m_third, buckets.m_first, buckets.m_second};
         static_assert(
-            std::is_same_v<decltype(guard), lockdep::ScopedGuard<3, fake::SequencedLock>>);
+            std::is_same_v<decltype(guard),
+                           lockdep::ScopedGuard<lockdep::NoOption, fake::SequencedLock,
+                                                fake::SequencedLock, fake::SequencedLock>>);
         all_held = static_cast<bool>(guard);
     }
     auto const ascending = fake::g_sequence_length == 3 &&
                            fake::g_sequence[0] < fake::g_sequence[1] &&
                            fake::g_sequence[1] < fake::g_sequence[2];
     {
-        lockdep::ScopedGuard<3, fake::SequencedLock> guard{buckets.m_second, buckets.m_third,
-                                                           buckets.m_first};
+        lockdep::ScopedGuard guard{buckets.m_second, buckets.m_third, buckets.m_first};
     }
     return all_held && ascending && g_report_count == 0 && !recorded();
 }
@@ -541,7 +541,7 @@ auto scoped_guard_takes_address_order() -> bool {
 // The option, given as a leading tag, applies to each lock: every saver is held
 // while the group is. Without the tag the same locks are held with no saver --
 // and a lock type that has policies for options must not lead deduction to
-// read its first lock as a tag.
+// read its first lock as a tag, whether one lock follows it or none.
 auto scoped_guard_with_option() -> bool {
     struct Pair {
         lockdep::Lock<fake::SpinLock> m_left{lockdep::lock_class<struct PairLock>()};
@@ -550,14 +550,23 @@ auto scoped_guard_with_option() -> bool {
     auto unsaved = false;
     {
         lockdep::ScopedGuard guard{pair.m_left, pair.m_right};
-        static_assert(std::is_same_v<decltype(guard), lockdep::ScopedGuard<2, fake::SpinLock>>);
+        static_assert(
+            std::is_same_v<decltype(guard), lockdep::ScopedGuard<lockdep::NoOption, fake::SpinLock,
+                                                                 fake::SpinLock>>);
         unsaved = fake::g_irq_depth == 0;
+    }
+    {
+        lockdep::ScopedGuard guard{pair.m_left};
+        static_assert(std::is_same_v<decltype(guard),
+                                     lockdep::ScopedGuard<lockdep::NoOption, fake::SpinLock>>);
+        unsaved = unsaved && fake::g_irq_depth == 0;
     }
     auto saved = false;
     {
         lockdep::ScopedGuard guard{lockdep::IRQ_SAVE, pair.m_left, pair.m_right};
-        static_assert(std::is_same_v<decltype(guard),
-                                     lockdep::ScopedGuard<2, fake::SpinLock, lockdep::IrqSave>>);
+        static_assert(
+            std::is_same_v<decltype(guard),
+                           lockdep::ScopedGuard<lockdep::IrqSave, fake::SpinLock, fake::SpinLock>>);
         saved = fake::g_irq_depth == 2;
     }
     return unsaved && saved && fake::g_irq_depth == 0;

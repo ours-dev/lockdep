@@ -11,6 +11,7 @@
 #include <lockdep/thread_lock_state.hpp>
 
 #include <optional>
+#include <tuple>
 #include <utility>
 
 #include <ours/compiler.hpp>
@@ -376,7 +377,7 @@ Guard(LockType &) -> Guard<LockType>;
 template <typename LockType, typename Option>
 Guard(LockType &, Option) -> Guard<LockType, Option>;
 
-/// Holds |Count| locks of one class at once, taking them in address order.
+/// Holds several locks of one class at once, taking them in address order.
 ///
 /// Two locks of one class held together are ordered by address, so any two
 /// sites that lock the same set agree on the order however they list it --
@@ -394,14 +395,34 @@ Guard(LockType &, Option) -> Guard<LockType, Option>;
 /// but only by leaving every lock but the one it blocks on unchecked. A fixed
 /// order keeps them all checked.
 ///
+/// Shaped like std::scoped_lock all the same: the locks' types are the class's
+/// parameter pack, so the count is sizeof... of it rather than a number a
+/// caller supplies, and class template argument deduction works straight from
+/// the constructors -- `ScopedGuard guard{a, b}` is a ScopedGuard<NoOption, T,
+/// T>, with no deduction guide written for it. Zircon's GuardMultiple takes
+/// the count as a parameter instead, which with deduction could only be
+/// filled in by guides restating what the constructor already says. The
+/// option comes first, in the type as in the call, because a class
+/// template's pack has to be its last parameter.
+///
 /// Meant for locks of one class. Locks of different classes are nested Guards,
 /// whose order is exactly what the validator is there to check; given here,
 /// they are taken in address order and validated as such.
-template <usize Count, typename LockType, typename Option = NoOption>
+template <typename Option = NoOption, typename... LockTypes>
 class ScopedGuard {
     using Self = ScopedGuard;
 
-    static_assert(Count > 0, "ScopedGuard needs at least one lock");
+    static constexpr usize COUNT = sizeof...(LockTypes);
+
+    static_assert(COUNT > 0, "ScopedGuard needs at least one lock");
+
+    /// The locks are sorted in one array and held by one kind of Guard, so
+    /// they are all of one type; the pack names it once per lock.
+    using LockType = std::tuple_element_t<0, std::tuple<LockTypes...>>;
+
+    static_assert(
+        (std::is_same_v<LockTypes, LockType> && ...),
+        "ScopedGuard holds locks of one type; locks of different types are nested Guards");
 
     /// The same restriction as Zircon's: a Nestable class orders its locks
     /// itself, and mixing that order with the address order would compare two
@@ -413,12 +434,10 @@ class ScopedGuard {
     /// Excluded from the thread-safety analysis, as Zircon's GuardMultiple is:
     /// the locks are held by Guards built inside std::optional, where the
     /// analysis cannot follow them.
-    template <typename... Locks>
-        requires(sizeof...(Locks) == Count && (std::is_same_v<Locks, Lock<LockType>> && ...))
-    TA_NO_THREAD_SAFETY_ANALYSIS explicit ScopedGuard(Locks &...locks) {
-        Lock<LockType> *sorted[Count] = {&locks...};
+    TA_NO_THREAD_SAFETY_ANALYSIS explicit ScopedGuard(Lock<LockTypes> &...locks) {
+        Lock<LockType> *sorted[COUNT] = {&locks...};
         sort_by_address(sorted);
-        for (usize i = 0; i < Count; ++i) {
+        for (usize i = 0; i < COUNT; ++i) {
             m_guards[i].emplace(*sorted[i], LockOrder{reinterpret_cast<usize>(sorted[i])});
         }
     }
@@ -428,12 +447,19 @@ class ScopedGuard {
     /// because a pack that is not the last parameter is never deduced: behind
     /// the locks, the tag would leave them undeducible. That is also where
     /// std::scoped_lock puts adopt_lock_t, while std::lock_guard, holding one
-    /// lock, puts it last. Constrained as Guard's tag form is, so that a guard
-    /// with no option does not take a NoOption the caller never wrote.
-    template <typename Tag, typename... Locks>
-        requires(!std::is_same_v<Option, NoOption> && std::is_same_v<Tag, Option> &&
-                 sizeof...(Locks) == Count && (std::is_same_v<Locks, Lock<LockType>> && ...))
-    TA_NO_THREAD_SAFETY_ANALYSIS explicit ScopedGuard(Tag, Locks &...locks)
+    /// lock, puts it last.
+    ///
+    /// The constraint is what keeps deduction unambiguous. Without it this
+    /// constructor would also read `guard{a, b}` as the tag `a` and one lock,
+    /// and `guard{a}` as the tag `a` and none, and tie with the one above. So
+    /// it takes only an option every lock type has a policy for, followed by
+    /// at least one lock -- stated over the class's template parameters, not
+    /// its members, because deduction checks it for specialisations such as
+    /// ScopedGuard<Lock<T>> that must never be instantiated. Like Guard's tag
+    /// form it also refuses a NoOption the caller never wrote.
+    TA_NO_THREAD_SAFETY_ANALYSIS explicit ScopedGuard(Option, Lock<LockTypes> &...locks)
+        requires(!std::is_same_v<Option, NoOption> && sizeof...(LockTypes) > 0 &&
+                 (HasPolicy<LockTypes, Option> && ...))
         : ScopedGuard(locks...) {}
 
     /// Released in the reverse of the acquisition order, highest address
@@ -443,7 +469,7 @@ class ScopedGuard {
     }
 
     TA_NO_THREAD_SAFETY_ANALYSIS auto release() -> void {
-        for (usize i = Count; i > 0; --i) {
+        for (usize i = COUNT; i > 0; --i) {
             if (m_guards[i - 1]) {
                 m_guards[i - 1]->unlock();
             }
@@ -463,10 +489,10 @@ class ScopedGuard {
   private:
     USTL_NO_MOVEABLE_AND_COPYABLE(ScopedGuard);
 
-    /// Insertion sort: Count is a handful, and for two it is one compare and
+    /// Insertion sort: COUNT is a handful, and for two it is one compare and
     /// swap.
-    static auto sort_by_address(Lock<LockType> *(&locks)[Count]) -> void {
-        for (usize i = 1; i < Count; ++i) {
+    static auto sort_by_address(Lock<LockType> *(&locks)[COUNT]) -> void {
+        for (usize i = 1; i < COUNT; ++i) {
             auto *const lock = locks[i];
             auto j = i;
             while (j > 0 && locks[j - 1] > lock) {
@@ -480,25 +506,8 @@ class ScopedGuard {
     /// Guards are neither movable nor default-constructible, and have to be
     /// constructed after sorting; an optional per slot is the plain way to
     /// construct each in place, where Zircon uses a union.
-    std::optional<Guard<LockType, Option>> m_guards[Count];
+    std::optional<Guard<LockType, Option>> m_guards[COUNT];
 };
-
-/// The count, the lock type and the option are all read off the arguments,
-/// as std::scoped_lock reads its lock types off its own: `ScopedGuard
-/// guard{a, b}` is a ScopedGuard<2, T>. Deduction is all or nothing -- once
-/// any template argument is written, none is deduced -- so an option cannot
-/// be spelled as one next to a deduced count, and travels as a tag instead.
-template <typename LockType, typename... Locks>
-ScopedGuard(Lock<LockType> &, Locks &...) -> ScopedGuard<1 + sizeof...(Locks), LockType>;
-
-/// `ScopedGuard guard{IRQ_SAVE, a, b}` is a ScopedGuard<2, T, IrqSave>.
-/// Constrained to an option the lock type has a policy for: unconstrained,
-/// this guide would also read `guard{a, b}` as a tag followed by one lock,
-/// and the two guides would be ambiguous.
-template <typename Option, typename LockType, typename... Locks>
-    requires HasPolicy<LockType, Option>
-ScopedGuard(Option, Lock<LockType> &, Locks &...)
-    -> ScopedGuard<1 + sizeof...(Locks), LockType, Option>;
 
 } // namespace lockdep
 
