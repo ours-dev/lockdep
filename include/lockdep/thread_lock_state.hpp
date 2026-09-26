@@ -272,10 +272,10 @@ class ThreadLockState {
     ///
     /// A state that is delivering a report, or holds a ReportingDisabled lock,
     /// is not reported against, since its holder may be the reporter itself.
-    /// The read is only sound while the running thread cannot move to another
-    /// CPU: validating an irq-unsafe lock has to happen with interrupts off,
-    /// which is what the policy's ValidationGuard is for -- Zircon's Mutex and
-    /// BrwLock policies use LockValidationGuard to the same end.
+    /// The read is sound because the environment hands the CPU's state only to
+    /// a context that cannot move to another CPU (see
+    /// system_get_thread_lock_state()); one that can is handed nullptr, and
+    /// holds no irq-safe lock to find.
     auto check_irq_safety_across_states(AcquiredLockEntry const &entry) -> void {
         // Not a pointer to const, though nothing is changed through it: ustl's
         // List::back() const does not compile, returning Option<T &> where it
@@ -368,12 +368,26 @@ namespace priv {
 
 } // namespace priv
 
-/// Fatal if the running context holds any tracked lock. Zircon's
-/// lockdep::AssertNoLocksHeld().
+/// Fatal if the running context holds any tracked lock -- placed before a
+/// call that may block, say. Zircon's lockdep::AssertNoLocksHeld() asks only
+/// the thread's state; with irq-safe locks kept on the CPU's, that lets a
+/// spin lock held into such a call pass unseen, so the state irq-safe locks
+/// go on is asked as well, where it is another one. A context that could move
+/// to another CPU is handed no such state (see system_get_thread_lock_state())
+/// and holds no irq-safe lock to find.
+///
+/// A context switch, where the scheduler holds irq-safe locks of its own on
+/// purpose, asks the outgoing thread's state alone, through
+/// ThreadLockState::assert_no_locks_held().
 inline auto assert_no_locks_held() -> void {
     if constexpr (LOCK_VALIDATION_ENABLED) {
-        if (auto *const state = system_get_thread_lock_state(ValidationOptions::None)) {
-            state->assert_no_locks_held();
+        auto *const thread_state = system_get_thread_lock_state(ValidationOptions::None);
+        if (thread_state != nullptr) {
+            thread_state->assert_no_locks_held();
+        }
+        auto *const irq_state = system_get_thread_lock_state(ValidationOptions::IrqSafe);
+        if (irq_state != nullptr && irq_state != thread_state) {
+            irq_state->assert_no_locks_held();
         }
     }
 }

@@ -228,6 +228,10 @@ namespace {
 lockdep::ThreadLockState g_thread_state;
 lockdep::ThreadLockState g_cpu_state;
 
+// Whether the running context could move to another CPU. The CPU's state is
+// handed only to a context that cannot; a test sets this to play one that can.
+bool g_can_migrate = false;
+
 constexpr auto RESULTS = 16;
 int g_results[RESULTS]{};
 int g_report_count = 0;
@@ -264,6 +268,9 @@ auto recorded() -> bool {
 namespace lockdep {
 auto system_get_thread_lock_state(ValidationOptions const options) -> ThreadLockState * {
     if ((options & ValidationOptions::IrqSafe) != ValidationOptions::None) {
+        if (g_can_migrate) {
+            return nullptr;
+        }
         return &g_cpu_state;
     }
     return &g_thread_state;
@@ -1030,14 +1037,36 @@ auto full_set_is_reported() -> bool {
     return fan_out(std::make_index_sequence<lockdep::DEPENDENCY_SET_CAPACITY + 1>{}) == 1;
 }
 
+// Fatal whenever the running context holds a lock -- an irq-safe one too,
+// which the environment keeps on the CPU's state rather than the thread's: a
+// spin lock held into a call that is about to block is exactly what this
+// assertion is placed before.
 auto no_locks_held_is_asserted() -> bool {
     fake::BareLock a;
+    lockdep::Lock<fake::SpinLock> spin{lockdep::lock_class<struct AssertSpinOwner>()};
 
     reset_reports();
     lockdep::assert_no_locks_held();
     auto const clean = g_fatal_count == 0;
     hold_as<ClassOf<struct AssertOwner>>(a, [] { lockdep::assert_no_locks_held(); });
-    return clean && g_fatal_count == 1;
+    auto const thread_lock_caught = g_fatal_count == 1;
+    {
+        lockdep::Guard guard{spin, lockdep::IRQ_SAVE};
+        lockdep::assert_no_locks_held();
+    }
+    auto const irq_safe_lock_caught = g_fatal_count == 2;
+
+    // A context that could move to another CPU is not handed the CPU's state:
+    // the locks on it belong to whatever runs there by the time they are
+    // read. Here another context's spin lock sits on it, and this context,
+    // which holds nothing, must not be blamed for it.
+    lockdep::AcquiredLockEntry theirs{&spin.lock(), spin.id()};
+    g_cpu_state.acquire(theirs);
+    g_can_migrate = true;
+    lockdep::assert_no_locks_held();
+    g_can_migrate = false;
+    g_cpu_state.release(theirs);
+    return clean && thread_lock_caught && irq_safe_lock_caught && g_fatal_count == 2;
 }
 
 // The same rule where the environment splits the states, as the kernel does:
@@ -1075,7 +1104,21 @@ auto irq_safety_is_checked_across_states() -> bool {
     }
     auto const suppressed = g_report_count == 0;
 
-    return reported && legal_order_quiet && suppressed && !recorded();
+    // A context that could move to another CPU is not handed the CPU's state,
+    // so another context's spin lock on it is not this acquisition's to
+    // answer for.
+    reset_reports();
+    lockdep::AcquiredLockEntry theirs{&spin.lock(), spin.id()};
+    g_cpu_state.acquire(theirs);
+    g_can_migrate = true;
+    {
+        lockdep::Guard taken{plain};
+    }
+    g_can_migrate = false;
+    g_cpu_state.release(theirs);
+    auto const not_handed = g_report_count == 0;
+
+    return reported && legal_order_quiet && suppressed && not_handed && !recorded();
 }
 
 // A Guard records an irq-safe lock on the CPU's state and anything else on the

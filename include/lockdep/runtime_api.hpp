@@ -26,16 +26,24 @@ class ThreadLockState;
 /// interrupted, and recording it on that thread's list would mix two
 /// contexts' acquisitions into one order.
 ///
-/// The split asks two things of the environment, both of the ValidationGuard
-/// in the lock's policy. The per-CPU list must only change with interrupts
-/// off, or a handler lands in the middle of the change: an option that takes
+/// The per-CPU list is handed only to a caller that cannot move to another
+/// CPU -- interrupts off or preemption disabled; one that can gets nullptr.
+/// lockdep reads that list from outside an irq-safe acquisition, for the
+/// irq-safe locks the running context holds (taking an irq-unsafe lock, see
+/// ThreadLockState::check_irq_safety_across_states(), and
+/// assert_no_locks_held()), and a caller that moved between being handed a
+/// CPU's list and reading it would read the locks of whatever runs there
+/// now, while they change. Nothing is missed by the refusal: a context that
+/// holds an irq-safe lock cannot move, since holding one keeps it on its CPU.
+///
+/// And the ValidationGuard in each lock's policy keeps the lists from being
+/// seen half-changed. The per-CPU list must only change with interrupts off,
+/// or a handler lands in the middle of the change, so an option that takes
 /// an irq-safe lock with interrupts on -- PreemptDisable on a spin lock --
-/// has to disable them for the validation. And taking an irq-unsafe lock
-/// also reads the per-CPU list, for the irq-safe locks held there (see
-/// ThreadLockState::check_irq_safety_across_states()), which is only sound
-/// while the thread cannot move to another CPU: the policy of an irq-unsafe
-/// lock has to disable interrupts for the validation too, as Zircon's Mutex
-/// and BrwLock policies do with LockValidationGuard.
+/// disables them for the validation. And an irq-unsafe lock's validation
+/// runs with interrupts off too, as Zircon's Mutex and BrwLock policies do
+/// with LockValidationGuard, so that a preemption never finds a thread's
+/// list halfway through a change.
 ///
 /// May return nullptr where there is no context yet -- early boot, before the
 /// first thread -- and the acquisition then goes unrecorded.

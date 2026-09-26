@@ -475,6 +475,12 @@ recorded. A state that is reporting, or holds a `ReportingDisabled` lock, is
 not reported against. An environment with a single state skips the check,
 since step 3 already covers it.
 
+`assert_no_locks_held()` asks both states for the same reason. Zircon's asks
+only the thread's, which lets a spin lock held into a call that is about to
+block -- what the assertion is placed before -- pass unseen. A context switch,
+where the scheduler holds irq-safe locks of its own on purpose, asks the
+outgoing thread's state alone, through the member of the same name.
+
 `ReportingDisabled` is a counter: held `ReportingDisabled` locks, plus one for
 the duration of every report and trigger, so a reporter that takes a lock -- a
 console lock, say -- cannot recurse into another report. `ActiveListDisabled`
@@ -574,14 +580,22 @@ as Zircon's `lock_dep.cc` does: an irq-safe lock can be taken in interrupt
 context, where the running thread is only the interrupted one. It may return
 nullptr before there is any context, and the acquisition then goes unrecorded.
 
-The split asks two things of the environment, both met by the policies'
-`ValidationGuard`s. The per-CPU state must only change with interrupts off, so
-an option that takes an irq-safe lock with interrupts on -- `PreemptDisable` on
-a spin lock -- disables them for the validation. And taking an irq-unsafe lock
-reads the per-CPU state, which is only sound while the thread cannot move to
-another CPU, so an irq-unsafe lock's policy disables interrupts for the
-validation as well, as Zircon's `Mutex` and `BrwLock` policies do with
-`LockValidationGuard`.
+The per-CPU state is handed only to a caller that cannot move to another CPU
+-- interrupts off or preemption disabled; one that can gets nullptr. lockdep
+reads that state from outside an irq-safe acquisition, to find the irq-safe
+locks the running context holds (taking an irq-unsafe lock, and
+`assert_no_locks_held()`), and a caller that moved between being handed a
+CPU's state and reading it would read the locks of whatever runs there now,
+while they change. Nothing is missed by the refusal: holding an irq-safe lock
+keeps a context on its CPU.
+
+The policies' `ValidationGuard`s keep the states from being seen half-changed.
+The per-CPU state must only change with interrupts off, so an option that
+takes an irq-safe lock with interrupts on -- `PreemptDisable` on a spin lock --
+disables them for the validation. And an irq-unsafe lock's validation runs
+with interrupts off as well, as Zircon's `Mutex` and `BrwLock` policies do
+with `LockValidationGuard`, so that a preemption never finds a thread's list
+halfway through a change.
 
 `system_trigger_loop_detection` only takes note; the environment runs
 `loop_detection_pass()` later on a context of its own -- detection never runs
@@ -600,10 +614,14 @@ itself; `system_init_thread_lock_state` is left out, as a default-constructed
   policies modeled on Zircon's `kernel/include/kernel/spinlock.h`
   (`NoIrqSavePolicy`, `IrqSavePolicy`, the try-lock variants).
 - `Thread` holds a `ThreadLockState`; each CPU's local data holds another.
+- `system_get_thread_lock_state()` hands out the per-CPU state only when the
+  caller cannot move to another CPU (interrupts off or preemption disabled),
+  and nullptr otherwise.
 - The policies' `ValidationGuard`s disable interrupts for the validation where
-  the split needs it: `Mutex` and every other irq-unsafe lock, whose
-  validation reads the per-CPU state, and every option that takes a spin lock
-  with interrupts on (`PreemptDisable`), whose validation changes it.
+  the split needs it: `Mutex` and every other irq-unsafe lock, so that a
+  preemption never finds a thread's list half-changed, and every option that
+  takes a spin lock with interrupts on (`PreemptDisable`), whose validation
+  changes the per-CPU state.
 - The variadic `ScopedGuard` is gone. A call site over locks of different
   classes becomes nested `Guard`s, one over several locks of one class a
   `ScopedGuard{IRQ_SAVE, a, b}`. The kernel has no call sites, only the

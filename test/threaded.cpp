@@ -222,6 +222,19 @@ auto survives_concurrent_recording() -> bool {
     return true;
 }
 
+// This environment keeps every lock on one state, so the state irq-safe locks
+// go on is the one already asked, and a lock held into assert_no_locks_held()
+// is reported once rather than twice.
+auto no_locks_held_is_asked_once() -> bool {
+    Mutex lock;
+    lockdep::AcquiredLockEntry entry{&lock, ClassOf<OwnerA>::id()};
+    auto const before = g_reports.load(std::memory_order_relaxed);
+    t_state.acquire(entry);
+    lockdep::assert_no_locks_held();
+    t_state.release(entry);
+    return g_reports.load(std::memory_order_relaxed) - before == 1;
+}
+
 // A guard used across threads must keep each thread's held list separate.
 auto contexts_are_per_thread() -> bool {
     Mutex lock;
@@ -250,6 +263,8 @@ auto main() -> int {
 
     check("contexts_are_per_thread", contexts_are_per_thread());
     check("survives_concurrent_recording", survives_concurrent_recording());
+    // After the test that requires no reports: this one makes one.
+    check("no_locks_held_is_asked_once", no_locks_held_is_asked_once());
     // Last: it leaves a cycle in the graph on purpose.
     check("catches_abba_across_threads", catches_abba_across_threads());
 
