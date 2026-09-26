@@ -153,6 +153,10 @@ namespace priv {
 
 } // namespace priv
 
+/// A lock type that can check that the current context holds it.
+template <typename LockType>
+concept AssertsHeld = requires(LockType const &lock) { lock.assert_held(); };
+
 /// A lock and the class it belongs to.
 ///
 /// Composition rather than Zircon's shape. Zircon makes the class part of the
@@ -190,6 +194,25 @@ class TA_CAPABILITY("lock") Lock {
     TA_RETURN_CAPABILITY(*this)
     auto lock() const -> LockType const & {
         return m_lock;
+    }
+
+    /// Asserts that the current context holds this lock, and tells the
+    /// thread-safety analysis so for code it cannot follow -- a function
+    /// reached only with the lock held, whose caller the analysis does not
+    /// see. Zircon's lockdep::AssertHeld().
+    ///
+    /// A member, not a free function as in Zircon: the analysis attribute has
+    /// to name what it asserts, and only a member can name its object
+    /// (TA_ASSERT() means *this) in the leading position that trailing return
+    /// types leave it. The runtime check is the inner lock's own
+    /// assert_held(); a lock type without one cannot be asserted on, since an
+    /// assertion the analysis trusts but nothing checks would be worse than
+    /// none.
+    TA_ASSERT()
+    auto assert_held() const -> void
+        requires AssertsHeld<LockType>
+    {
+        static_cast<void>(m_lock.assert_held());
     }
 
     /// INVALID_LOCK_CLASS_ID when lock metadata is compiled out.

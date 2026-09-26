@@ -130,11 +130,11 @@ state.
 
 ## Known limits
 
-- A lock can now be declared with its own class --
-  `lockdep::Lock<SpinLock> m_lock{lockdep::lock_class<struct MyLock>()}` -- but
-  `Guard` does not take a `Lock<T>` yet. Until it does, a bare `Guard{lock}`
-  falls back to `DefaultLockClass<Lock>`, which is shared by every lock of that
-  type, so two different spinlocks still look like one class to the validator.
+- A lock declared as `lockdep::Lock<SpinLock> m_lock{lockdep::lock_class<struct MyLock>()}`
+  has a class of its own, and a `Guard` over it records it under that class. A
+  bare lock -- every lock in the kernel today -- still falls back to
+  `DefaultLockClass<Lock>`, shared by every lock of its type, so two different
+  bare spinlocks still look like one class to the validator.
 - `LOCKDEP_MAX_DEPENDENCIES` (default 32) bounds the successors one class can
   record. Overflow is reported and costs completeness, not soundness.
 - `ValidationOptions::IrqSafe`, `SingletonLock` and `ActiveListDisabled` are

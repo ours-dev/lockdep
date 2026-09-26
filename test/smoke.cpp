@@ -101,12 +101,19 @@ LOCK_DEP_TRAITS(LeafLock, lockdep::ValidationOptions::Leaf);
 // checks what Guard and the policies do with it. The other fakes carry no
 // annotations, and a policy that took a lock unannotated compiled cleanly
 // against them while failing on every lock in the kernel.
+inline int g_assert_held_calls = 0;
+
 struct TA_CAPABILITY("mutex") AnnotatedLock {
     TA_ACQUIRE()
     auto acquire() -> void {}
 
     TA_RELEASE()
     auto release() -> void {}
+
+    TA_ASSERT()
+    auto assert_held() const -> void {
+        ++g_assert_held_calls;
+    }
 };
 LOCKDEP_STATE_SAVER(AnnotatedLock, lockdep::SavedStateOption::IrqSave, AutoInterruptDisabler);
 
@@ -334,6 +341,94 @@ auto named_classes() -> bool {
                options_of(one.m_first.id()) == irq_safe &&
                options_of(one.m_second.id()) == (irq_safe | leaf) &&
                g_constant_lock.id() != lockdep::INVALID_LOCK_CLASS_ID;
+    }
+}
+
+// Guards over declared locks.
+
+lockdep::Lock<fake::AnnotatedLock> g_wrapped{lockdep::lock_class<struct GuardedData>()};
+int g_guarded_value TA_GUARDED(g_wrapped) = 0;
+
+// Two locks of one type, each declared with its own class, nest without the
+// validator taking them for one lock. Two bare locks of that type do not: they
+// share DefaultLockClass, which is the limitation declaring them removes.
+auto declared_locks_nest() -> bool {
+    Owner owner;
+    reset_reports();
+    {
+        lockdep::Guard outer{owner.m_first};
+        lockdep::Guard inner{owner.m_second};
+        static_assert(std::is_same_v<decltype(outer), lockdep::Guard<fake::SpinLock>>,
+                      "a Guard over Lock<T> is a Guard<T>");
+    }
+    auto const declared_clean = g_reacquire_reports == 0;
+
+    fake::SpinLock a;
+    fake::SpinLock b;
+    reset_reports();
+    {
+        lockdep::Guard outer{a};
+        lockdep::Guard inner{b};
+    }
+    if constexpr (lockdep::LOCK_VALIDATION_ENABLED) {
+        return declared_clean && g_reacquire_reports == 1;
+    } else {
+        return declared_clean && g_reacquire_reports == 0;
+    }
+}
+
+// The capability a Guard over a Lock acquires is the Lock, which is what the
+// data is guarded by; -Wthread-safety would reject the write otherwise.
+auto write_under_guard() -> bool {
+    lockdep::Guard<fake::AnnotatedLock, lockdep::IrqSave> guard{g_wrapped};
+    g_guarded_value = 1;
+    return fake::g_irq_depth == 1;
+}
+
+// What a helper reached only with the lock held does: it asserts, the lock
+// checks, and the analysis takes the assertion's word for the write.
+auto touch_under_assertion() -> void {
+    g_wrapped.assert_held();
+    g_guarded_value = 2;
+}
+
+auto assert_held_checks() -> bool {
+    lockdep::Guard<fake::AnnotatedLock, lockdep::IrqSave> guard{g_wrapped};
+    auto const before = fake::g_assert_held_calls;
+    touch_under_assertion();
+    return fake::g_assert_held_calls == before + 1;
+}
+
+auto recorded() -> bool {
+    return !lockdep::current_lock_context()->empty();
+}
+
+auto call_unlocked_drops_and_retakes(fake::SpinLock &lock) -> bool {
+    lockdep::Guard<fake::SpinLock, lockdep::IrqSave> guard{lock};
+    auto inside = false;
+    guard.call_unlocked([&] {
+        // Released through the policy: unlocked, state restored, unrecorded.
+        inside = !lock.held && fake::g_irq_depth == 0 && !recorded();
+    });
+    auto const retaken = lock.held && guard.held() && fake::g_irq_depth == 1;
+    if constexpr (lockdep::LOCK_VALIDATION_ENABLED) {
+        return inside && retaken && recorded();
+    } else {
+        return inside && retaken;
+    }
+}
+
+auto call_untracked_keeps_the_lock(fake::SpinLock &lock) -> bool {
+    lockdep::Guard<fake::SpinLock, lockdep::IrqSave> guard{lock};
+    auto inside = false;
+    guard.call_untracked([&] {
+        // Still held, state still saved; only the record is gone.
+        inside = lock.held && fake::g_irq_depth == 1 && !recorded();
+    });
+    if constexpr (lockdep::LOCK_VALIDATION_ENABLED) {
+        return inside && lock.held && recorded();
+    } else {
+        return inside && lock.held;
     }
 }
 
@@ -696,6 +791,11 @@ auto main() -> int {
     check("class_ids_are_distinct", class_ids_are_distinct());
     check("named_classes", named_classes());
     check("annotated_through_lock", annotated_through_lock());
+    check("declared_locks_nest", declared_locks_nest());
+    check("write_under_guard", write_under_guard());
+    check("assert_held_checks", assert_held_checks());
+    check("call_unlocked_drops_and_retakes", call_unlocked_drops_and_retakes(a));
+    check("call_untracked_keeps_the_lock", call_untracked_keeps_the_lock(a));
     check("plain_guard", plain_guard(a));
     check("irq_guard", irq_guard(a));
     check("combined_guard", combined_guard(a));

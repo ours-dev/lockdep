@@ -288,36 +288,42 @@ here needs either yet, so it is left out until something does, along with
 template <typename LockType, typename Option = NoOption>
 class Guard {
   public:
-    template <typename... StateArgs>
-    explicit Guard(Lock<LockType> &lock, StateArgs &&...);
-
-    // Nestable classes only: an explicit order among locks of the same class.
-    template <typename... StateArgs>
-    Guard(Lock<LockType> &lock, usize order, StateArgs &&...)
-        requires NESTABLE;
-
-    Guard(AdoptLock, Lock<LockType> &lock, Adoptable &&);
+    explicit Guard(Lock<LockType> &lock);       // recorded under the declared class
+    Guard(LockType &lock);                      // transitional: DefaultLockClass<LockType>
+    Guard(Lock<LockType> &lock, Option);        // tag-object form, Guard guard{lock, IRQ_SAVE}
 
     ~Guard();
 
-    auto release(auto &&...release_args) -> void;
-    auto call_unlocked(auto &&op, auto &&...release_args) -> void;
+    auto unlock() -> void;                      // Zircon's Release()
+    auto unguard() -> void;                     // hand the lock off without releasing it
+    auto call_unlocked(auto &&op) -> void;
     auto call_untracked(auto &&op) -> void;
-    auto take() -> Adoptable;
 
-    explicit operator bool() const;             // false after release or a failed try-lock
-    auto wraps_lock(LockType const &) const -> bool;
-    auto lock() const -> LockType const *;
+    auto held() const -> bool;
+    explicit operator bool() const;             // false after unlock or a failed try-lock
 
     Guard(Guard const &) = delete;
     auto operator=(Guard const &) -> Guard & = delete;
 };
 
-template <typename LockType, typename Option = NoOption>
-auto assert_held(Lock<LockType> const &) -> void;
-
-class NullGuard;   // same surface, does nothing
+// On Lock<LockType>, for a lock type that can check it:
+auto Lock<LockType>::assert_held() const -> void;   // TA_ASSERT()
 ```
+
+`assert_held()` is a member of `Lock<T>` rather than Zircon's free
+`AssertHeld()`: the analysis attribute has to name what it asserts, and with
+trailing return types only a member can name its object (`TA_ASSERT()`, meaning
+`*this`) in the leading position left to it. The inner lock's own
+`assert_held()` does the runtime check; a lock type without one cannot be
+asserted on.
+
+Still to come, after `ThreadLockState` (they depend on it):
+
+- `take()` and `Guard(AdoptLock, Lock<LockType> &, Adoptable &&)`, which move a
+  held lock's record to another scope. That means replacing a node in the
+  held-lock list in place, O(1) only once the list is doubly linked.
+- The nestable constructor `Guard(Lock<LockType> &, usize order)`, whose order
+  the validator has to compare against the held entry of the same class.
 
 The acquire sequence is Zircon's `ValidateAndAcquire`, and its order is the
 point of the policy split:
@@ -351,6 +357,11 @@ class GuardMultiple {
 Takes the locks in address order, so any two sites locking the same set agree
 on the order. Replaces `ScopedGuard`; locks of *different* classes are simply
 nested `Guard`s, whose order is exactly what lockdep is there to check.
+
+It lands after `ThreadLockState`. Two locks of one class held together read as
+a re-acquisition unless each record carries an order -- the address, here --
+and the validator checks that the orders rise, as Zircon's
+`ThreadLockState::Acquire()` does with `AcquiredLockEntry::order()`.
 
 ## Per-context state — `thread_lock_state.hpp`
 

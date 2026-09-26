@@ -117,9 +117,25 @@ class TA_SCOPED_CAPABILITY Guard {
                   "acquire() returning bool, and release()");
 
   public:
-    using Lock = LockType;
+    /// Takes a lock declared as lockdep::Lock<LockType>, recording it under
+    /// the class its declaration named.
+    ///
+    /// The capability acquired is the Lock itself, which is what members are
+    /// guarded by: TA_GUARDED(m_pi_lock) with m_pi_lock the Lock.
+    explicit Guard(::lockdep::Lock<LockType> &lock) TA_ACQUIRE(lock)
+        : m_lock(lock.lock()), m_entry(lock.id()) {
+        this->guard();
+    }
 
-    Guard(Lock &lock) TA_ACQUIRE(lock) : m_lock(lock), m_entry(DefaultLockClass<Lock>::id()) {
+    /// Takes a bare lock, which has no class of its own: it is recorded under
+    /// DefaultLockClass<LockType>, shared by every lock of its type.
+    ///
+    /// Transitional. It is what every Guard in the kernel still uses, and it
+    /// is also why nesting two different spin locks reads to the validator as
+    /// taking one lock twice; it goes once the kernel's locks are declared as
+    /// lockdep::Lock.
+    Guard(LockType &lock) TA_ACQUIRE(lock)
+        : m_lock(lock), m_entry(DefaultLockClass<LockType>::id()) {
         this->guard();
     }
 
@@ -135,7 +151,11 @@ class TA_SCOPED_CAPABILITY Guard {
     /// names the parameter.
     template <typename Tag>
         requires(!std::is_same_v<Option, NoOption> && std::is_same_v<Tag, Option>)
-    Guard(Lock &lock, Tag) TA_ACQUIRE(lock) : Guard(lock) {}
+    Guard(::lockdep::Lock<LockType> &lock, Tag) TA_ACQUIRE(lock) : Guard(lock) {}
+
+    template <typename Tag>
+        requires(!std::is_same_v<Option, NoOption> && std::is_same_v<Tag, Option>)
+    Guard(LockType &lock, Tag) TA_ACQUIRE(lock) : Guard(lock) {}
 
     ~Guard() TA_RELEASE() {
         unlock();
@@ -185,6 +205,43 @@ class TA_SCOPED_CAPABILITY Guard {
 
     explicit operator bool() const {
         return m_held;
+    }
+
+    /// Releases the lock around |op| and takes it back afterwards, so that one
+    /// guard can cover a larger scope with an unlocked stretch in the middle
+    /// -- typically a loop that has to drop the lock to do something that may
+    /// block. Zircon's Guard::CallUnlocked().
+    ///
+    /// The release goes through the policy, so |op| runs with the state the
+    /// guard saved restored -- interrupts back on, for IrqSave -- and the
+    /// retake repeats the whole acquisition, validation included. A guard
+    /// that does not hold its lock runs |op| and leaves the lock alone.
+    template <typename Op>
+    TA_NO_THREAD_SAFETY_ANALYSIS auto call_unlocked(Op &&op) -> void {
+        if (!m_held) {
+            std::forward<Op>(op)();
+            return;
+        }
+        release_lock();
+        m_held = false;
+        std::forward<Op>(op)();
+        guard();
+    }
+
+    /// Withdraws the record of the acquisition around |op| without releasing
+    /// the lock. For the narrow case where validation is more pessimistic than
+    /// the code: |op| asserts that no locks are held, say, and this lock is in
+    /// fact safe to hold across it. A scoped form of TrackingDisabled that is
+    /// meant to be temporary. Zircon's Guard::CallUntracked().
+    template <typename Op>
+    auto call_untracked(Op &&op) -> void {
+        if (!m_held) {
+            std::forward<Op>(op)();
+            return;
+        }
+        unregister();
+        std::forward<Op>(op)();
+        record();
     }
 
   private:
@@ -242,7 +299,7 @@ class TA_SCOPED_CAPABILITY Guard {
         }
     }
 
-    Lock &m_lock;
+    LockType &m_lock;
 
     /// Whatever the policy keeps while the lock is held -- the saved interrupt
     /// state, for IrqSave.
@@ -274,6 +331,12 @@ class Guard<void> {
         return false;
     }
 };
+
+template <typename LockType>
+Guard(Lock<LockType> &) -> Guard<LockType>;
+
+template <typename LockType, typename Option>
+Guard(Lock<LockType> &, Option) -> Guard<LockType, Option>;
 
 template <typename LockType>
 Guard(LockType &) -> Guard<LockType>;
