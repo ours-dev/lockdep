@@ -15,7 +15,8 @@
 #include <lockdep/lock_class.hpp>
 #include <lockdep/lock_class_state.hpp>
 #include <lockdep/lock_context.hpp>
-#include <lockdep/report.hpp>
+#include <lockdep/runtime_api.hpp>
+#include <lockdep/thread_lock_state.hpp>
 
 #include <atomic>
 #include <mutex>
@@ -67,22 +68,33 @@ std::atomic<int> g_cycle_reports{0};
 
 // Each thread gets its own held-lock list, exactly as each Thread does in
 // the kernel.  Nothing else about the context is shared, which is what lets
-// validate_acquire run without a lock of its own.
-thread_local lockdep::LockContext t_context;
+// ThreadLockState::acquire run without a lock of its own.
+thread_local lockdep::ThreadLockState t_state;
 
 } // namespace
 
 namespace lockdep {
-auto current_lock_context() -> LockContext * {
-    return &t_context;
+// Every acquisition here goes on the running thread's own state; the threads
+// take no irq-safe locks, so there is no CPU state to hand out.
+auto system_get_thread_lock_state(ValidationOptions) -> ThreadLockState * {
+    return &t_state;
 }
 
-auto report_violation(ViolationReport const &report) -> void {
+auto system_lock_validation_error(AcquiredLockEntry const &, AcquiredLockEntry const *,
+                                  ThreadLockState const &, LockResult) -> void {
     g_reports.fetch_add(1, std::memory_order_relaxed);
-    if (report.violation == Violation::CircularDependency) {
-        g_cycle_reports.fetch_add(1, std::memory_order_relaxed);
-    }
 }
+
+auto system_lock_validation_fatal(AcquiredLockEntry const &, ThreadLockState const &, LockResult)
+    -> void {
+    g_reports.fetch_add(1, std::memory_order_relaxed);
+}
+
+auto system_circular_lock_dependency_detected(LockClassId) -> void {
+    g_cycle_reports.fetch_add(1, std::memory_order_relaxed);
+}
+
+auto system_trigger_loop_detection() -> void {}
 } // namespace lockdep
 
 namespace {
@@ -91,8 +103,8 @@ namespace {
 // Stands in for the instrumenting wrapper call sites will eventually use.
 template <typename Owner, typename Body>
 auto hold(Mutex &lock, Body &&body) -> void {
-    lockdep::AcquiredLockEntry entry{ClassOf<Owner>::id()};
-    auto *context = lockdep::current_lock_context();
+    lockdep::AcquiredLockEntry entry{&lock, ClassOf<Owner>::id()};
+    auto *context = &t_state;
     context->acquire(entry);
     lock.acquire();
     body();
@@ -117,7 +129,7 @@ auto catches_abba_across_threads() -> bool {
     Mutex a;
     Mutex b;
 
-    auto const before = lockdep::detect_lock_order_cycles();
+    auto const before = lockdep::loop_detection_pass();
 
     std::atomic<int> arrived{0};
     auto barrier = [&arrived] {
@@ -139,12 +151,12 @@ auto catches_abba_across_threads() -> bool {
     second.join();
 
     // Each thread's context must have drained; they are separate objects.
-    if (!lockdep::current_lock_context()->empty()) {
+    if (!t_state.empty()) {
         std::printf("    the main thread's context is not empty\n");
         return false;
     }
 
-    auto const after = lockdep::detect_lock_order_cycles();
+    auto const after = lockdep::loop_detection_pass();
     if (after <= before) {
         std::printf("    detector missed the cross-thread inversion (%zu -> %zu)\n", before, after);
         return false;
@@ -202,8 +214,8 @@ auto contexts_are_per_thread() -> bool {
     std::atomic<bool> ok{true};
 
     std::thread worker([&] {
-        lockdep::AcquiredLockEntry entry{ClassOf<OwnerA>::id()};
-        auto *context = lockdep::current_lock_context();
+        lockdep::AcquiredLockEntry entry{&lock, ClassOf<OwnerA>::id()};
+        auto *context = &t_state;
         context->acquire(entry);
         // The main thread holds nothing, and must still hold nothing while
         // this thread holds something.
@@ -214,7 +226,7 @@ auto contexts_are_per_thread() -> bool {
     });
     worker.join();
 
-    return ok.load() && lockdep::current_lock_context()->empty();
+    return ok.load() && t_state.empty();
 }
 
 } // namespace

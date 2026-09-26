@@ -46,7 +46,8 @@ file names, and `std::` facilities over ustl wrappers.
 
 | Header | Zircon counterpart | Holds |
 | --- | --- | --- |
-| `lockdep/config.hpp` | `common.h` | feature level, `LockClassId`, `LockResult`, limits |
+| `lockdep/config.hpp` | `common.h` | feature level, limits |
+| `lockdep/types.hpp` | `common.h` | `LockClassId`, `LockResult` |
 | `lockdep/lock_traits.hpp` | `lock_traits.h` | `ValidationOptions`, `lockdep_traits` lookup |
 | `lockdep/lock_policy.hpp` | `lock_policy.h` | option tags, the `LockPolicy` concept, `lockdep_policy` lookup |
 | `lockdep/lock_class.hpp` | `lock_class.h` | `lock_class<Tag>()`, `Lock<T>` |
@@ -368,61 +369,91 @@ and the validator checks that the orders rise, as Zircon's
 ```cpp
 class AcquiredLockEntry {
   public:
-    auto address() const -> void *;
+    explicit AcquiredLockEntry(void const *address, LockClassId id, usize order = 0);
+    auto address() const -> void const *;
     auto id() const -> LockClassId;
     auto order() const -> usize;
+    auto is_linked() const -> bool;
   private:
-    void *m_address;
-    LockClassId m_id;
-    usize m_order;
+    ...
     ustl::collections::intrusive::ListMemberHook<> m_hook;   // member, not a base
 };
 
 class ThreadLockState {
   public:
-    auto acquire(AcquiredLockEntry &) -> void;
+    auto acquire(AcquiredLockEntry &) -> void;   // validate, record edges, list
     auto release(AcquiredLockEntry &) -> void;
     auto assert_no_locks_held() -> void;
+    auto empty() const -> bool;
     auto last_result() const -> LockResult;     // for tests
+    auto reporting_disabled() const -> bool;
 };
 
 auto assert_no_locks_held() -> void;
+
+using LockContext = /* ThreadLockState, or an empty stand-in without validation */;
 ```
 
-The checks inside `acquire` are Zircon's, in Zircon's order: leaf, same class
-(re-entrance / already acquired / invalid nesting), then for each new edge the
-irq-safety rule and the reverse-edge check. Only a *new* edge triggers loop
-detection. `ReportingDisabled` is a counter, and a report itself raises it so a
-report that takes a lock (a console lock, say) cannot recurse into lockdep —
-the hazard the current `report_violation` leaves open.
+The checks inside `acquire` are Zircon's `ThreadLockState::Acquire()`, in its
+order, for each held entry:
 
-The held list becomes doubly linked (Zircon uses
-`fbl::DoublyLinkedList`): out-of-order release is O(1) instead of a scan.
+1. the held lock is a `Leaf` — `AcquireAfterLeaf`, fatal;
+2. the held lock is of the same class — the same address is `Reentrance`;
+   otherwise, unless the class is `MultiAcquire`, the new order must rise above
+   the held one, and failing that a non-`Nestable` class at order zero is
+   `AlreadyAcquired` (fatal if `ReAcquireFatal`) and anything else
+   `InvalidNesting`;
+3. otherwise the pair is an edge held → new. Only a **new** edge is checked --
+   `InvalidIrqSafety` if the held lock is irq-safe and the new one is not,
+   `OutOfOrder` if the reverse edge is in the graph -- and only a new edge
+   triggers loop detection. An edge already in the graph was checked when it
+   went in, so an ordering that recurs is reported once rather than at every
+   acquisition.
+
+`ReportingDisabled` is a counter: held `ReportingDisabled` locks, plus one for
+the duration of every report and trigger, so a reporter that takes a lock -- a
+console lock, say -- cannot recurse into another report. `ActiveListDisabled`
+validates but does not keep the entry; `TrackingDisabled` skips the lock
+entirely.
+
+The held list is doubly linked, like Zircon's `fbl::DoublyLinkedList`:
+out-of-order release is O(1), and so will be moving an entry to another frame
+once `take()` needs it. The hook's `SafeLink` mode traps an entry destroyed
+while still listed, which is Zircon's `!InContainer()` assertion.
+
+`LockContext` is the name the kernel's `Thread` member was declared with; it
+stays as the alias that collapses to an empty type without validation.
 
 ## Graph — `lock_class_state.hpp`
 
 ```cpp
-class LockClassState {
+class ValidatorLockClassState {
   public:
-    static auto get(LockClassId) -> LockClassState *;
-    auto flags() const -> ValidationOptions;
-    auto name() const -> char const *;
-    // Validation only:
-    auto has_dependency(LockClassId) const -> bool;
-    auto add_dependency(LockClassId) -> LockResult;
+    auto has_dependency(Self const *) const -> bool;
+    auto add_dependency(Self *) -> AddResult;   // Added, Present, Full
+    ...
 };
 
-auto loop_detection_pass() -> void;
+auto options_of(LockClassId) -> ValidationOptions;
+auto loop_detection_pass() -> usize;             // cycles found, each reported once
 ```
 
-One class, with the metadata and validator parts as members selected by the
-feature level, where Zircon chains `LockClassState` → `MetadataLockClassState`
-→ `ValidatorLockClassState` through inheritance.
+An edge held → new is stored in the held class's set, its successors; Zircon
+stores the same edge in the new class's set, its predecessors. Either works;
+what matters is that `OutOfOrder` asks for the reverse edge in the matching set.
+`add_dependency` tells a new edge from a known one, which is what lets the
+validator check and trigger only on new edges -- Zircon's `AddLockClass()`
+returning `Success` or `DependencyExists`.
 
-The dependency set moves from a linear array to Zircon's lock-free
-open-addressed hash set (`lock_dependency_set.h`), sized to a prime; lookups on
-the acquire path stop being linear in the fan-out. Loop detection stays
-Tarjan's, as now.
+`loop_detection_pass()` is Tarjan's strongly-connected-components walk,
+iterative, with its scratch state in the nodes. It reports each cycle once,
+through `system_circular_lock_dependency_detected()`, naming the component's
+root as Zircon's detector does.
+
+Still to come: the metadata and validator parts as members selected by the
+feature level rather than Zircon's inheritance chain, and the dependency set
+as Zircon's lock-free open-addressed hash set (`lock_dependency_set.h`) instead
+of a linear array.
 
 ## Environment — `runtime_api.hpp`
 
@@ -430,21 +461,29 @@ Declared by lockdep, defined by the kernel; referenced only when validation is
 enabled.
 
 ```cpp
-auto system_get_thread_lock_state(ValidationOptions flags) -> ThreadLockState *;
-auto system_init_thread_lock_state(ThreadLockState *) -> void;
-auto system_lock_validation_error(AcquiredLockEntry *bad, AcquiredLockEntry *conflicting,
-                                  ThreadLockState *, void *caller, LockResult) -> void;
-auto system_lock_validation_fatal(AcquiredLockEntry *bad, ThreadLockState *,
-                                  void *caller, LockResult) -> void;
-auto system_circular_lock_dependency_detected(LockClassState *root) -> void;
+auto system_get_thread_lock_state(ValidationOptions options) -> ThreadLockState *;
+auto system_lock_validation_error(AcquiredLockEntry const &entry,
+                                  AcquiredLockEntry const *conflicting,
+                                  ThreadLockState const &state, LockResult result) -> void;
+auto system_lock_validation_fatal(AcquiredLockEntry const &entry,
+                                  ThreadLockState const &state, LockResult result) -> void;
+auto system_circular_lock_dependency_detected(LockClassId root) -> void;
 auto system_trigger_loop_detection() -> void;
 ```
 
-`system_get_thread_lock_state` receives the flags so the kernel can return the
-per-CPU state for irq-safe locks and the per-thread state otherwise, as
-Zircon's `lock_dep.cc` does. `system_trigger_loop_detection` only marks the
-graph dirty; a worker calls `loop_detection_pass()` — detection never runs on
-the acquire path.
+`system_get_thread_lock_state` receives the lock's options so the kernel can
+return the per-CPU state for irq-safe locks and the per-thread state otherwise,
+as Zircon's `lock_dep.cc` does: an irq-safe lock can be taken in interrupt
+context, where the running thread is only the interrupted one. It may return
+nullptr before there is any context, and the acquisition then goes unrecorded.
+`system_trigger_loop_detection` only takes note; the environment runs
+`loop_detection_pass()` later on a context of its own -- detection never runs
+on the acquire path.
+
+Compared with Zircon: no caller address or frame is passed, since the
+environment's reporter sits in the same call chain and can take a backtrace
+itself; `system_init_thread_lock_state` is left out, as a default-constructed
+`ThreadLockState` is ready to use.
 
 ## What changes for the kernel
 

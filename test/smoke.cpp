@@ -8,8 +8,9 @@
 #include <lockdep/lock_context.hpp>
 #include <lockdep/lock_policy.hpp>
 #include <lockdep/lock_traits.hpp>
-#include <lockdep/report.hpp>
+#include <lockdep/runtime_api.hpp>
 #include <lockdep/state_saver.hpp>
+#include <lockdep/thread_lock_state.hpp>
 #include <lockdep/types.hpp>
 
 #include <tuple>
@@ -148,7 +149,9 @@ inline int g_trace_length = 0;
 inline int g_saved = 0;
 
 inline auto trace(char const call) -> void {
-    g_trace[g_trace_length] = TraceEntry{call, !lockdep::current_lock_context()->empty()};
+    auto const *const state =
+        lockdep::system_get_thread_lock_state(lockdep::ValidationOptions::None);
+    g_trace[g_trace_length] = TraceEntry{call, !state->empty()};
     ++g_trace_length;
 }
 
@@ -204,43 +207,76 @@ struct IrqSave {};
 // --- environment seams -------------------------------------------------------
 
 namespace {
-lockdep::Violation g_last_violation{};
+// The two kinds of held-lock state an environment keeps: one for irq-safe
+// locks -- the CPU's, in a kernel -- and one for everything else -- the
+// running thread's. The split is Zircon's; see system_get_thread_lock_state().
+lockdep::ThreadLockState g_thread_state;
+lockdep::ThreadLockState g_cpu_state;
+
+constexpr auto RESULTS = 16;
+int g_results[RESULTS]{};
 int g_report_count = 0;
+int g_fatal_count = 0;
 int g_cycle_reports = 0;
-int g_reacquire_reports = 0;
-int g_leaf_reports = 0;
+int g_trigger_count = 0;
+lockdep::LockResult g_last_result = lockdep::LockResult::Success;
+
+// Set to make the reporter itself take a lock, the way a kernel reporter takes
+// its console lock.
+lockdep::AcquiredLockEntry *g_reporter_entry = nullptr;
 
 auto reset_reports() -> void {
+    for (auto &count: g_results) {
+        count = 0;
+    }
     g_report_count = 0;
+    g_fatal_count = 0;
     g_cycle_reports = 0;
-    g_reacquire_reports = 0;
-    g_leaf_reports = 0;
+    g_trigger_count = 0;
+    g_last_result = lockdep::LockResult::Success;
+}
+
+auto reports_of(lockdep::LockResult const result) -> int {
+    return g_results[static_cast<int>(result)];
+}
+
+// Whether any acquisition is recorded as held, on either state.
+auto recorded() -> bool {
+    return !g_thread_state.empty() || !g_cpu_state.empty();
 }
 } // namespace
 
 namespace lockdep {
-static LockContext g_context;
-
-auto current_lock_context() -> LockContext * {
-    return &g_context;
+auto system_get_thread_lock_state(ValidationOptions const options) -> ThreadLockState * {
+    if ((options & ValidationOptions::IrqSafe) != ValidationOptions::None) {
+        return &g_cpu_state;
+    }
+    return &g_thread_state;
 }
 
-auto report_violation(ViolationReport const &report) -> void {
-    g_last_violation = report.violation;
+auto system_lock_validation_error(AcquiredLockEntry const &, AcquiredLockEntry const *,
+                                  ThreadLockState const &, LockResult const result) -> void {
+    ++g_results[static_cast<int>(result)];
     ++g_report_count;
-    switch (report.violation) {
-        case Violation::CircularDependency:
-            ++g_cycle_reports;
-            break;
-        case Violation::ReAcquire:
-            ++g_reacquire_reports;
-            break;
-        case Violation::LeafAcquire:
-            ++g_leaf_reports;
-            break;
-        case Violation::DependencySetFull:
-            break;
+    g_last_result = result;
+    if (g_reporter_entry != nullptr) {
+        // Validated in the middle of a report: must not report again.
+        g_thread_state.acquire(*g_reporter_entry);
+        g_thread_state.release(*g_reporter_entry);
     }
+}
+
+auto system_lock_validation_fatal(AcquiredLockEntry const &, ThreadLockState const &, LockResult)
+    -> void {
+    ++g_fatal_count;
+}
+
+auto system_circular_lock_dependency_detected(LockClassId) -> void {
+    ++g_cycle_reports;
+}
+
+auto system_trigger_loop_detection() -> void {
+    ++g_trigger_count;
 }
 } // namespace lockdep
 
@@ -317,10 +353,6 @@ static_assert(lockdep::LOCK_METADATA_AVAILABLE ||
                   sizeof(lockdep::Lock<fake::SpinLock>) == sizeof(fake::SpinLock),
               "without metadata a Lock costs exactly what its inner lock costs");
 
-auto options_of(lockdep::LockClassId const id) -> lockdep::ValidationOptions {
-    return static_cast<lockdep::MetadataLockClassState const *>(id)->options();
-}
-
 auto named_classes() -> bool {
     Owner const one;
     Owner const two;
@@ -338,8 +370,8 @@ auto named_classes() -> bool {
                // One tag on two lock types, two classes.
                one.m_first.id() != one.m_bare.id() &&
                // The lock type's options, and the declaration's on top.
-               options_of(one.m_first.id()) == irq_safe &&
-               options_of(one.m_second.id()) == (irq_safe | leaf) &&
+               lockdep::options_of(one.m_first.id()) == irq_safe &&
+               lockdep::options_of(one.m_second.id()) == (irq_safe | leaf) &&
                g_constant_lock.id() != lockdep::INVALID_LOCK_CLASS_ID;
     }
 }
@@ -361,7 +393,7 @@ auto declared_locks_nest() -> bool {
         static_assert(std::is_same_v<decltype(outer), lockdep::Guard<fake::SpinLock>>,
                       "a Guard over Lock<T> is a Guard<T>");
     }
-    auto const declared_clean = g_reacquire_reports == 0;
+    auto const declared_clean = reports_of(lockdep::LockResult::AlreadyAcquired) == 0;
 
     fake::SpinLock a;
     fake::SpinLock b;
@@ -371,9 +403,9 @@ auto declared_locks_nest() -> bool {
         lockdep::Guard inner{b};
     }
     if constexpr (lockdep::LOCK_VALIDATION_ENABLED) {
-        return declared_clean && g_reacquire_reports == 1;
+        return declared_clean && reports_of(lockdep::LockResult::AlreadyAcquired) == 1;
     } else {
-        return declared_clean && g_reacquire_reports == 0;
+        return declared_clean && reports_of(lockdep::LockResult::AlreadyAcquired) == 0;
     }
 }
 
@@ -397,10 +429,6 @@ auto assert_held_checks() -> bool {
     auto const before = fake::g_assert_held_calls;
     touch_under_assertion();
     return fake::g_assert_held_calls == before + 1;
-}
-
-auto recorded() -> bool {
-    return !lockdep::current_lock_context()->empty();
 }
 
 auto call_unlocked_drops_and_retakes(fake::SpinLock &lock) -> bool {
@@ -508,8 +536,7 @@ auto unguard_keeps_saved_state(fake::SpinLock &lock) -> bool {
         guard.unguard();
         // Handed off, not released: the lock stays taken and the state stays
         // saved, but the record of the acquisition is gone with the frame.
-        kept = lock.held && !guard.held() && fake::g_irq_depth == 1 &&
-               lockdep::current_lock_context()->empty();
+        kept = lock.held && !guard.held() && fake::g_irq_depth == 1 && !recorded();
     }
     // The new owner releases; the frame that saved the state restored it.
     lock.release();
@@ -574,8 +601,8 @@ auto failed_try_lock() -> bool {
     auto nothing_left = false;
     {
         lockdep::Guard<fake::PolicyLock, fake::TryLock> guard{lock};
-        nothing_left = !guard.held() && !static_cast<bool>(guard) && fake::g_saved == 0 &&
-                       lockdep::current_lock_context()->empty();
+        nothing_left =
+            !guard.held() && !static_cast<bool>(guard) && fake::g_saved == 0 && !recorded();
     }
     constexpr auto V = lockdep::LOCK_VALIDATION_ENABLED;
     bool const recorded[] = {false, V};
@@ -608,17 +635,25 @@ static_assert(lockdep::LOCK_VALIDATION_ENABLED ||
 template <typename Owner>
 using ClassOf = lockdep::LockClass<Owner, fake::BareLock>;
 
-// A guard that names its class explicitly, standing in for the instrumenting
-// wrapper that call sites will eventually use.
-template <typename Owner>
-auto hold(fake::BareLock &lock, auto &&body) -> void {
-    lockdep::AcquiredLockEntry entry{ClassOf<Owner>::id()};
-    auto *context = lockdep::current_lock_context();
-    context->acquire(entry);
+// A class with options of its own, for the rules those options switch on.
+template <typename Owner, lockdep::ValidationOptions Options>
+using ClassWith = lockdep::LockClass<Owner, fake::BareLock, 0, Options>;
+
+// Records an acquisition of |lock| under |Class| on the thread's state around
+// |body|, the way a Guard would.
+template <typename Class>
+auto hold_as(fake::BareLock &lock, auto &&body, usize const order = 0) -> void {
+    lockdep::AcquiredLockEntry entry{&lock, Class::id(), order};
+    g_thread_state.acquire(entry);
     lock.acquire();
     body();
     lock.release();
-    context->release(entry);
+    g_thread_state.release(entry);
+}
+
+template <typename Owner>
+auto hold(fake::BareLock &lock, auto &&body) -> void {
+    hold_as<ClassOf<Owner>>(lock, body);
 }
 
 auto records_edges_in_one_direction() -> bool {
@@ -634,7 +669,12 @@ auto records_edges_in_one_direction() -> bool {
         std::printf("  consistent order reported %d violations\n", g_report_count);
         return false;
     }
-    return lockdep::detect_lock_order_cycles() == 0;
+    // Only the first acquisition added an edge, and only it asked for a pass.
+    if (g_trigger_count != 1) {
+        std::printf("  %d loop-detection triggers for one new edge\n", g_trigger_count);
+        return false;
+    }
+    return lockdep::loop_detection_pass() == 0;
 }
 
 auto catches_direct_inversion() -> bool {
@@ -645,14 +685,16 @@ auto catches_direct_inversion() -> bool {
     hold<fake::OwnerB>(b, [&] { hold<fake::OwnerC>(c, [] {}); });
     // Now the other way round: this closes a two-node cycle.
     hold<fake::OwnerC>(c, [&] { hold<fake::OwnerB>(b, [] {}); });
+    // And again: the edge is known now, so the inversion is not re-reported.
+    hold<fake::OwnerC>(c, [&] { hold<fake::OwnerB>(b, [] {}); });
 
-    if (g_cycle_reports == 0) {
-        std::printf("  inversion was not reported at acquire time\n");
+    if (reports_of(lockdep::LockResult::OutOfOrder) != 1) {
+        std::printf("  inversion reported %d times at acquire time, not once\n",
+                    reports_of(lockdep::LockResult::OutOfOrder));
         return false;
     }
     // And the detector must see the same cycle in the graph.
-    auto const cycles = lockdep::detect_lock_order_cycles();
-    if (cycles == 0) {
+    if (lockdep::loop_detection_pass() == 0 || g_cycle_reports == 0) {
         std::printf("  detector found no cycle after an inversion\n");
         return false;
     }
@@ -667,105 +709,214 @@ auto catches_transitive_cycle() -> bool {
     fake::BareLock e;
     fake::BareLock f;
 
-    auto const before = lockdep::detect_lock_order_cycles();
+    auto const before = lockdep::loop_detection_pass();
 
     reset_reports();
     hold<fake::OwnerD>(d, [&] { hold<fake::OwnerE>(e, [] {}); }); // D -> E
     hold<fake::OwnerE>(e, [&] { hold<fake::OwnerF>(f, [] {}); }); // E -> F
     hold<fake::OwnerF>(f, [&] { hold<fake::OwnerD>(d, [] {}); }); // F -> D
 
-    if (g_cycle_reports != 0) {
-        std::printf("  acquire path claimed to see a transitive cycle (%d reports)\n",
-                    g_cycle_reports);
+    if (reports_of(lockdep::LockResult::OutOfOrder) != 0) {
+        std::printf("  acquire path claimed to see a transitive cycle\n");
         return false;
     }
 
     reset_reports();
-    auto const after = lockdep::detect_lock_order_cycles();
+    auto const after = lockdep::loop_detection_pass();
     if (after <= before) {
         std::printf("  detector missed the transitive cycle (%zu -> %zu)\n", before, after);
         return false;
     }
-    if (g_cycle_reports == 0) {
-        std::printf("  detector found a cycle but reported nothing\n");
+    // One report for the one new cycle, naming its root.
+    if (g_cycle_reports != static_cast<int>(after)) {
+        std::printf("  %d cycle reports for %zu cycles\n", g_cycle_reports, after);
         return false;
     }
 
     // A second pass must reach the same conclusion; the walk marks nodes as it
     // goes and has to leave them usable for the next run.
-    if (lockdep::detect_lock_order_cycles() != after) {
+    if (lockdep::loop_detection_pass() != after) {
         std::printf("  a repeated pass disagreed with the first\n");
         return false;
     }
     return true;
 }
 
-// LockContext::release claims releases need not nest.  Take two, drop the
-// outer one first, and the list must still end up empty.
+// Releases need not nest. Take two, drop the outer one first, and the list
+// must still end up empty.
 auto release_need_not_nest() -> bool {
-    using ClassA = lockdep::LockClass<fake::OwnerA, fake::BareLock>;
-    using ClassB = lockdep::LockClass<fake::OwnerB, fake::BareLock>;
+    fake::BareLock a;
+    fake::BareLock b;
+    lockdep::AcquiredLockEntry outer{&a, ClassOf<fake::OwnerA>::id()};
+    lockdep::AcquiredLockEntry inner{&b, ClassOf<fake::OwnerB>::id()};
 
-    auto *context = lockdep::current_lock_context();
-    lockdep::AcquiredLockEntry outer{ClassA::id()};
-    lockdep::AcquiredLockEntry inner{ClassB::id()};
-
-    context->acquire(outer);
-    context->acquire(inner);
-    context->release(outer);
-    if (context->empty()) {
+    g_thread_state.acquire(outer);
+    g_thread_state.acquire(inner);
+    g_thread_state.release(outer);
+    if (g_thread_state.empty()) {
         std::printf("  releasing the outer entry dropped the inner one too\n");
         return false;
     }
-    context->release(inner);
-    return context->empty();
+    g_thread_state.release(inner);
+    return g_thread_state.empty();
 }
 
-auto nestable_may_recurse() -> bool {
-    using Class = lockdep::LockClass<fake::OwnerNestable, fake::NestableLock>;
-
+// A second lock of a class already held.
+template <typename Class>
+auto second_of_class(void const *first, void const *second, usize const first_order,
+                     usize const second_order) -> lockdep::LockResult {
     reset_reports();
-    lockdep::AcquiredLockEntry outer{Class::id()};
-    lockdep::AcquiredLockEntry inner{Class::id()};
-    auto *context = lockdep::current_lock_context();
-    context->acquire(outer);
-    context->acquire(inner);
-    context->release(inner);
-    context->release(outer);
-
-    return g_reacquire_reports == 0;
+    lockdep::AcquiredLockEntry outer{first, Class::id(), first_order};
+    lockdep::AcquiredLockEntry inner{second, Class::id(), second_order};
+    g_thread_state.acquire(outer);
+    g_thread_state.acquire(inner);
+    auto const result = g_thread_state.last_result();
+    g_thread_state.release(inner);
+    g_thread_state.release(outer);
+    return result;
 }
 
-auto non_nestable_recursion_is_reported() -> bool {
-    using Class = lockdep::LockClass<fake::OwnerA, fake::BareLock>;
+auto same_class_rules() -> bool {
+    fake::BareLock a;
+    fake::BareLock b;
+    using Plain = ClassOf<fake::OwnerA>;
+    using Nestable = ClassWith<struct NestableOwner, lockdep::ValidationOptions::Nestable>;
+    using Multi = ClassWith<struct MultiOwner, lockdep::ValidationOptions::MultiAcquire>;
+    using Fatal = ClassWith<struct FatalOwner, lockdep::ValidationOptions::ReAcquireFatal>;
 
-    reset_reports();
-    lockdep::AcquiredLockEntry outer{Class::id()};
-    lockdep::AcquiredLockEntry inner{Class::id()};
-    auto *context = lockdep::current_lock_context();
-    context->acquire(outer);
-    context->acquire(inner);
-    context->release(inner);
-    context->release(outer);
-
-    return g_reacquire_reports == 1 && g_last_violation == lockdep::Violation::ReAcquire;
+    using lockdep::LockResult;
+    // The very same lock twice, whatever the class says.
+    auto const reentrance = second_of_class<Multi>(&a, &a, 0, 0) == LockResult::Reentrance;
+    // A second lock of a plain class.
+    auto const already = second_of_class<Plain>(&a, &b, 0, 0) == LockResult::AlreadyAcquired;
+    // A nestable class needs its order to rise, and then nests freely.
+    auto const nesting = second_of_class<Nestable>(&a, &b, 2, 1) == LockResult::InvalidNesting;
+    auto const nested = second_of_class<Nestable>(&a, &b, 1, 2) == LockResult::Success;
+    // Any number of a MultiAcquire class, in any order.
+    auto const multi = second_of_class<Multi>(&a, &b, 0, 0) == LockResult::Success;
+    // ReAcquireFatal makes the plain mistake fatal.
+    auto const fatal =
+        second_of_class<Fatal>(&a, &b, 0, 0) == LockResult::AlreadyAcquired && g_fatal_count == 1;
+    return reentrance && already && nesting && nested && multi && fatal;
 }
 
 auto leaf_must_be_last() -> bool {
-    fake::LeafLock leaf;
+    fake::BareLock leaf;
     fake::BareLock other;
-    using LeafClass = lockdep::LockClass<fake::OwnerLeaf, fake::LeafLock>;
 
     reset_reports();
-    lockdep::AcquiredLockEntry leaf_entry{LeafClass::id()};
-    auto *context = lockdep::current_lock_context();
-    context->acquire(leaf_entry);
-    leaf.acquire();
-    hold<fake::OwnerC>(other, [] {});
-    leaf.release();
-    context->release(leaf_entry);
+    hold_as<ClassWith<struct LeafOwner, lockdep::ValidationOptions::Leaf>>(
+        leaf, [&] { hold<fake::OwnerC>(other, [] {}); });
+    // Reported, and fatal.
+    return reports_of(lockdep::LockResult::AcquireAfterLeaf) == 1 && g_fatal_count == 1 &&
+           g_last_result == lockdep::LockResult::AcquireAfterLeaf;
+}
 
-    return g_leaf_reports == 1 && g_last_violation == lockdep::Violation::LeafAcquire;
+// An irq-unsafe lock taken while an irq-safe one is held. The environment
+// keeps the two kinds on different states, so this can only be seen where it
+// hands out one state for both -- the check is there for such environments.
+auto irq_safety_is_checked() -> bool {
+    fake::BareLock safe;
+    fake::BareLock unsafe;
+
+    reset_reports();
+    hold_as<ClassWith<struct IrqSafeOwner, lockdep::ValidationOptions::IrqSafe>>(
+        safe, [&] { hold_as<ClassOf<struct IrqUnsafeOwner>>(unsafe, [] {}); });
+    return reports_of(lockdep::LockResult::InvalidIrqSafety) == 1;
+}
+
+// While a ReportingDisabled lock is held nothing is reported, and reporting
+// resumes when it is released.
+auto reporting_disabled_suspends_reports() -> bool {
+    fake::BareLock quiet;
+    fake::BareLock a;
+    fake::BareLock b;
+    using Quiet = ClassWith<struct QuietOwner, lockdep::ValidationOptions::ReportingDisabled>;
+    using Plain = ClassOf<struct QuietPlainOwner>;
+
+    reset_reports();
+    hold_as<Quiet>(quiet, [&] {
+        // A second lock of a plain class: would be AlreadyAcquired.
+        hold_as<Plain>(a, [&] { hold_as<Plain>(b, [] {}); });
+    });
+    auto const suspended = g_report_count == 0;
+    hold_as<Plain>(a, [&] { hold_as<Plain>(b, [] {}); });
+    return suspended && g_report_count == 1;
+}
+
+// A reporter that takes a lock is not validated into a second report.
+auto reporter_cannot_recurse() -> bool {
+    fake::BareLock a;
+    fake::BareLock b;
+    fake::BareLock console;
+    using Plain = ClassOf<struct RecursionOwner>;
+    // The reporter's lock is of the same class, so were it validated it would
+    // be one more AlreadyAcquired.
+    lockdep::AcquiredLockEntry reporter{&console, Plain::id()};
+
+    reset_reports();
+    g_reporter_entry = &reporter;
+    hold_as<Plain>(a, [&] { hold_as<Plain>(b, [] {}); });
+    g_reporter_entry = nullptr;
+    return g_report_count == 1;
+}
+
+// ActiveListDisabled: validated, but not kept on the list.
+auto active_list_disabled() -> bool {
+    fake::BareLock a;
+    fake::BareLock b;
+    using Hidden = ClassWith<struct HiddenOwner, lockdep::ValidationOptions::ActiveListDisabled>;
+
+    reset_reports();
+    auto hidden_kept = true;
+    hold_as<ClassOf<struct HiddenOuterOwner>>(a, [&] {
+        hold_as<Hidden>(b, [&] { hidden_kept = !g_thread_state.empty() && g_trigger_count == 1; });
+    });
+    // The outer lock is on the list; the hidden one is not, but its edge was
+    // recorded all the same.
+    return hidden_kept;
+}
+
+// TrackingDisabled: neither recorded nor validated.
+auto tracking_disabled() -> bool {
+    fake::BareLock a;
+    fake::BareLock b;
+    using Untracked =
+        ClassWith<struct UntrackedOwner, lockdep::ValidationOptions::TrackingDisabled>;
+
+    reset_reports();
+    auto untracked = false;
+    hold_as<Untracked>(a, [&] {
+        untracked = g_thread_state.empty();
+        hold_as<Untracked>(b, [] {});
+    });
+    return untracked && g_report_count == 0 && g_trigger_count == 0;
+}
+
+auto no_locks_held_is_asserted() -> bool {
+    fake::BareLock a;
+
+    reset_reports();
+    lockdep::assert_no_locks_held();
+    auto const clean = g_fatal_count == 0;
+    hold_as<ClassOf<struct AssertOwner>>(a, [] { lockdep::assert_no_locks_held(); });
+    return clean && g_fatal_count == 1;
+}
+
+// A Guard records an irq-safe lock on the CPU's state and anything else on the
+// thread's, as system_get_thread_lock_state() hands them out.
+auto states_follow_irq_safety(fake::SpinLock &irq_safe, fake::BareLock &plain) -> bool {
+    auto on_cpu = false;
+    {
+        lockdep::Guard guard{irq_safe};
+        on_cpu = !g_cpu_state.empty() && g_thread_state.empty();
+    }
+    auto on_thread = false;
+    {
+        lockdep::Guard guard{plain};
+        on_thread = g_cpu_state.empty() && !g_thread_state.empty();
+    }
+    return on_cpu && on_thread;
 }
 
 // --- driver ------------------------------------------------------------------
@@ -811,7 +962,7 @@ auto main() -> int {
     check("void_guard", void_guard());
 
     check("savers unwound", fake::g_irq_depth == 0 && fake::g_preempt_depth == 0);
-    check("context drained", lockdep::current_lock_context()->empty());
+    check("context drained", !recorded());
 
     // The graph only exists when validation is compiled in.  Everywhere else
     // these paths must still run and simply observe nothing.
@@ -819,14 +970,20 @@ auto main() -> int {
         check("records_edges_in_one_direction", records_edges_in_one_direction());
         check("release_need_not_nest", release_need_not_nest());
         check("catches_transitive_cycle", catches_transitive_cycle());
-        check("nestable_may_recurse", nestable_may_recurse());
-        check("non_nestable_recursion_is_reported", non_nestable_recursion_is_reported());
+        check("same_class_rules", same_class_rules());
         check("leaf_must_be_last", leaf_must_be_last());
+        check("irq_safety_is_checked", irq_safety_is_checked());
+        check("reporting_disabled_suspends_reports", reporting_disabled_suspends_reports());
+        check("reporter_cannot_recurse", reporter_cannot_recurse());
+        check("active_list_disabled", active_list_disabled());
+        check("tracking_disabled", tracking_disabled());
+        check("no_locks_held_is_asserted", no_locks_held_is_asserted());
+        check("states_follow_irq_safety", states_follow_irq_safety(a, bare));
         // Run last: it leaves a cycle in the graph on purpose.
         check("catches_direct_inversion", catches_direct_inversion());
     } else {
         reset_reports();
-        check("detector is inert", lockdep::detect_lock_order_cycles() == 0);
+        check("detector is inert", lockdep::loop_detection_pass() == 0);
         check("nothing reported", g_report_count == 0);
     }
 

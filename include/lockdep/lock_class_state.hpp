@@ -5,7 +5,7 @@
 
 #include <lockdep/config.hpp>
 #include <lockdep/lock_traits.hpp>
-#include <lockdep/report.hpp>
+#include <lockdep/runtime_api.hpp>
 #include <lockdep/types.hpp>
 
 #include <atomic>
@@ -132,24 +132,41 @@ class ValidatorLockClassState: public MetadataLockClassState {
         return false;
     }
 
-    /// Records the edge `this -> dependency`.  Returns false only when the
-    /// set is full, which costs completeness rather than soundness.
+    enum class AddResult {
+        /// The edge is new: the graph changed.
+        Added,
+
+        /// The edge was already recorded.
+        Present,
+
+        /// The set is full and the edge went unrecorded, which costs
+        /// completeness rather than soundness.
+        Full,
+    };
+
+    /// Records the edge `this -> dependency`.
+    ///
+    /// The validator needs to tell a new edge from a known one: only a new
+    /// edge can have changed what is true of the graph, so only then does it
+    /// check the pair and ask for a loop-detection pass. That is Zircon's
+    /// AddLockClass() returning Success versus DependencyExists.
     ///
     /// Two contexts recording the same edge at once can both miss the
-    /// duplicate check and take two slots.  That wastes capacity but does
-    /// not change what the detector concludes.
-    auto add_dependency(Self *dependency) -> bool {
+    /// duplicate check, take two slots and both see Added. That wastes
+    /// capacity and repeats a check, but does not change what the detector
+    /// concludes.
+    auto add_dependency(Self *dependency) -> AddResult {
         if (has_dependency(dependency)) {
-            return true;
+            return AddResult::Present;
         }
 
         auto const slot = m_dependency_count.fetch_add(1, std::memory_order_acq_rel);
         if (slot >= MAX_DEPENDENCIES) {
-            return false;
+            return AddResult::Full;
         }
 
         m_dependencies[slot].store(dependency, std::memory_order_release);
-        return true;
+        return AddResult::Added;
     }
 
     /// Recovers the node behind a class id.
@@ -271,7 +288,9 @@ class ValidatorLockClassState::LoopDetector {
         return node;
     }
 
-    /// Pops the component rooted at `root` and reports it if it is a cycle.
+    /// Pops the component rooted at `root` and reports it once if it is a
+    /// cycle, naming its root -- as Zircon's detector reports a connected set
+    /// by its root rather than member by member.
     auto close(Node *root) -> usize {
         usize members = 0;
         Node *member = nullptr;
@@ -281,37 +300,19 @@ class ValidatorLockClassState::LoopDetector {
             member->next = nullptr;
             member->on_stack = false;
             ++members;
-
-            if (member != root) {
-                report(root->state, member->state);
-            }
         } while (member != root);
 
-        if (members > 1) {
-            return 1;
+        // A single-node component is a cycle only when the class depends on
+        // itself: one context taking two locks of that class in a fixed order
+        // can meet another taking them in the other order.
+        auto const cyclic = members > 1 || root->state->has_dependency(root->state);
+        if (!cyclic) {
+            return 0;
         }
-
-        // A single-node component is still a cycle when the class depends
-        // on itself: one context taking two locks of that class in a fixed
-        // order can meet another taking them in the other order.
-        if (root->state->has_dependency(root->state)) {
-            report(root->state, root->state);
-            return 1;
+        if (!root->state->has(ValidationOptions::ReportingDisabled)) {
+            system_circular_lock_dependency_detected(root->state->id());
         }
-        return 0;
-    }
-
-    static auto report(ValidatorLockClassState *root, ValidatorLockClassState *member) -> void {
-        if (root->has(ValidationOptions::ReportingDisabled) ||
-            member->has(ValidationOptions::ReportingDisabled)) {
-            return;
-        }
-        report_violation(ViolationReport{
-            Violation::CircularDependency,
-            member->id(),
-            root->id(),
-            root->has(ValidationOptions::ReAcquireFatal),
-        });
+        return 1;
     }
 
     auto visit(ValidatorLockClassState *root) -> usize {
@@ -371,17 +372,31 @@ class ValidatorLockClassState::LoopDetector {
     Node *m_stack{nullptr};
 };
 
-/// Walks the dependency graph once and reports every cycle it finds.
+/// Walks the dependency graph once and reports every cycle it finds, through
+/// system_circular_lock_dependency_detected(). Zircon's LoopDetectionPass().
 ///
-/// Safe to call from anywhere that is not holding a lock being validated.
-/// Returns the number of cycles found, so a test or a boot-time check can
-/// assert on it.
-inline auto detect_lock_order_cycles() -> usize {
+/// The environment runs it in response to system_trigger_loop_detection(), on
+/// a context of its own and never concurrently with itself. Returns the number
+/// of cycles found, so a test or a boot-time check can assert on it.
+inline auto loop_detection_pass() -> usize {
     if constexpr (LOCK_VALIDATION_ENABLED) {
         ValidatorLockClassState::LoopDetector detector;
         return detector.run();
     } else {
         return 0;
+    }
+}
+
+/// The options of the class behind |id|, as merged from its declaration and
+/// its lock type; None where there is no metadata to read them from.
+inline auto options_of(LockClassId const id) -> ValidationOptions {
+    if constexpr (!LOCK_METADATA_AVAILABLE) {
+        return ValidationOptions::None;
+    } else {
+        if (id == INVALID_LOCK_CLASS_ID) {
+            return ValidationOptions::None;
+        }
+        return static_cast<MetadataLockClassState const *>(id)->options();
     }
 }
 

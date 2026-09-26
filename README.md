@@ -14,12 +14,12 @@ or not it has ever actually deadlocked.
 
 Work is split by cost:
 
-- **On every acquisition** (`LockContext::validate_acquire`) lockdep records the
+- **On every acquisition** (`ThreadLockState::acquire`) lockdep records the
   edges and checks what is cheap to see from there: a direct inversion of an
   ordering already recorded, a class acquired twice without `Nestable`, and
   anything taken while a `Leaf` lock is held. This is O(locks currently held)
   and allocates nothing.
-- **On demand** (`detect_lock_order_cycles()`) it walks the whole graph with
+- **On demand** (`loop_detection_pass()`) it walks the whole graph with
   Tarjan's algorithm and reports every cycle, including transitive ones like
   `A -> B -> C -> A` that no single acquisition can see. This is
   O(classes + edges) and belongs on an idle thread or in a test, not on the
@@ -88,12 +88,18 @@ written scope guard, and `Thread` carries no lock context.
 
 ## What the environment must supply
 
-Two functions, referenced only when validation is enabled, so a build with
-`lockdep_enable=false` links without them:
+Five functions, declared in `include/lockdep/runtime_api.hpp` and referenced
+only when validation is enabled, so a build with `lockdep_enable=false` links
+without them:
 
-- `lockdep::current_lock_context()` — the lock context of the running execution
-  context, or `nullptr` before there is one.
-- `lockdep::report_violation()` — how this kernel logs or panics.
+- `system_get_thread_lock_state(options)` -- the held-lock state an acquisition
+  belongs on: the CPU's for an irq-safe lock, the running thread's otherwise.
+- `system_lock_validation_error()` and `system_lock_validation_fatal()` -- how
+  this kernel logs or panics.
+- `system_circular_lock_dependency_detected()` -- a cycle found by
+  `loop_detection_pass()`.
+- `system_trigger_loop_detection()` -- a new ordering edge; arrange for
+  `loop_detection_pass()` to run later, off the acquire path.
 
 ## Tests
 

@@ -7,6 +7,8 @@
 #include <lockdep/lock_class.hpp>
 #include <lockdep/lock_context.hpp>
 #include <lockdep/lock_policy.hpp>
+#include <lockdep/runtime_api.hpp>
+#include <lockdep/thread_lock_state.hpp>
 
 #include <tuple>
 #include <utility>
@@ -16,43 +18,46 @@
 
 namespace lockdep {
 namespace priv {
-    /// Remembers which lock context a Guard registered with, so the release
-    /// unregisters from that same context. Empty when validation is off.
+    /// Remembers which held-lock state a Guard recorded its acquisition on, so
+    /// that the release withdraws it from that same state. Empty when
+    /// validation is off.
     ///
-    /// Access goes through get()/set() rather than the member directly: the
-    /// holder's type does not depend on the guard's template parameters, so
-    /// the discarded branch of an `if constexpr` inside the guard is still name
-    /// checked and has to compile against the empty specialisation too.
-    ///
-    /// LockContext is spelled fully qualified on purpose. Inside namespace
-    /// priv the bare name finds priv::LockContext, the validating class,
-    /// before the lockdep::LockContext alias that picks between it and
-    /// priv::NullLockContext by feature level. With validation off the two
-    /// differ, and the discarded branch then fails to compile -- which clang
-    /// 23 reports and older compilers silently let through.
+    /// The two specialisations deliberately give the same expressions
+    /// different but matching types. The holder's type does not depend on the
+    /// guard's template parameters, so the discarded branch of an
+    /// `if constexpr (LOCK_VALIDATION_ENABLED)` inside the guard is still type
+    /// checked against it -- clang 23 checks it, older compilers let it
+    /// through. With validation on, get() yields the ThreadLockState that
+    /// takes the guard's AcquiredLockEntry; with it off, the empty stand-in
+    /// that takes the empty stand-in entry. set() takes what
+    /// system_get_thread_lock_state() returns in both.
     template <bool Enabled>
     struct ContextHolder {
         [[nodiscard]]
-        auto get() const -> ::lockdep::LockContext * {
-            return m_context;
+        auto get() const -> ThreadLockState * {
+            return m_state;
         }
 
-        auto set(::lockdep::LockContext *context) -> void {
-            m_context = context;
+        auto set(ThreadLockState *const state) -> void {
+            m_state = state;
         }
 
-        ::lockdep::LockContext *m_context{nullptr};
+        ThreadLockState *m_state{nullptr};
     };
 
     template <>
     struct ContextHolder<false> {
         [[nodiscard]]
-        auto get() const -> ::lockdep::LockContext * {
+        auto get() const -> NullThreadLockState * {
             return nullptr;
         }
 
-        auto set(::lockdep::LockContext *) -> void {}
+        auto set(ThreadLockState *) -> void {}
     };
+
+    /// The record a Guard keeps of its acquisition: a real entry where
+    /// validation is compiled in, an empty stand-in elsewhere.
+    using GuardEntry = IfLockValidationEnabled<AcquiredLockEntry, NullAcquiredLockEntry>;
 
     /// The policy a Guard holds its lock with, or DefaultLockPolicy standing in
     /// once the Guard's own assertion has already reported that there is none
@@ -123,7 +128,7 @@ class TA_SCOPED_CAPABILITY Guard {
     /// The capability acquired is the Lock itself, which is what members are
     /// guarded by: TA_GUARDED(m_pi_lock) with m_pi_lock the Lock.
     explicit Guard(::lockdep::Lock<LockType> &lock) TA_ACQUIRE(lock)
-        : m_lock(lock.lock()), m_entry(lock.id()) {
+        : m_lock(lock.lock()), m_entry(&lock.lock(), lock.id()) {
         this->guard();
     }
 
@@ -135,7 +140,7 @@ class TA_SCOPED_CAPABILITY Guard {
     /// taking one lock twice; it goes once the kernel's locks are declared as
     /// lockdep::Lock.
     Guard(LockType &lock) TA_ACQUIRE(lock)
-        : m_lock(lock), m_entry(DefaultLockClass<LockType>::id()) {
+        : m_lock(lock), m_entry(&lock, DefaultLockClass<LockType>::id()) {
         this->guard();
     }
 
@@ -279,21 +284,24 @@ class TA_SCOPED_CAPABILITY Guard {
         Policy::release(m_lock, m_state);
     }
 
+    /// Recorded on the state the environment hands out for this lock's
+    /// options -- the CPU's for an irq-safe lock, the thread's otherwise --
+    /// under the policy's validation guard.
     auto record() -> void {
         if constexpr (LOCK_VALIDATION_ENABLED) {
             typename Policy::ValidationGuard const validation_guard{};
-            m_context.set(current_lock_context());
-            if (auto *context = m_context.get()) {
-                context->acquire(m_entry);
+            m_context.set(system_get_thread_lock_state(options_of(m_entry.id())));
+            if (auto *const state = m_context.get()) {
+                state->acquire(m_entry);
             }
         }
     }
 
     auto unregister() -> void {
         if constexpr (LOCK_VALIDATION_ENABLED) {
-            if (auto *context = m_context.get()) {
+            if (auto *const state = m_context.get()) {
                 typename Policy::ValidationGuard const validation_guard{};
-                context->release(m_entry);
+                state->release(m_entry);
                 m_context.set(nullptr);
             }
         }
@@ -311,7 +319,7 @@ class TA_SCOPED_CAPABILITY Guard {
     /// out, so a guard then costs no more than it did before lockdep had
     /// anything to say.
     [[no_unique_address]]
-    AcquiredLockEntry m_entry;
+    priv::GuardEntry m_entry;
     [[no_unique_address]]
     priv::ContextHolder<LOCK_VALIDATION_ENABLED> m_context;
 

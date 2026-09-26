@@ -19,8 +19,9 @@ cpp_interface("lockdep") {
     "include/lockdep/lock_context.hpp",
     "include/lockdep/lock_policy.hpp",
     "include/lockdep/lock_traits.hpp",
-    "include/lockdep/report.hpp",
+    "include/lockdep/runtime_api.hpp",
     "include/lockdep/state_saver.hpp",
+    "include/lockdep/thread_lock_state.hpp",
     "include/lockdep/types.hpp",
   ]
 
