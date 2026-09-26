@@ -76,8 +76,10 @@ class AcquiredLockEntry {
 ///
 /// "Context" is the environment's to define: system_get_thread_lock_state()
 /// hands out the running thread's state for most locks and the CPU's for
-/// irq-safe ones. Either way the state is only ever touched by the context it
-/// belongs to, so it needs no lock of its own.
+/// irq-safe ones. Either way the state is only ever changed by the context it
+/// belongs to, so it needs no lock of its own. The one reach across is a read:
+/// taking an irq-unsafe lock looks at the CPU's state for irq-safe locks held,
+/// see check_irq_safety_across_states().
 class ThreadLockState {
     using Self = ThreadLockState;
 
@@ -100,6 +102,10 @@ class ThreadLockState {
     ///      edge is new is anything checked or triggered: an edge already in
     ///      the graph was checked when it went in, so an ordering that recurs
     ///      is reported once rather than at every acquisition.
+    ///
+    /// and, where the environment keeps irq-safe locks on a state of their
+    /// own, one check Zircon leaves out: an irq-unsafe lock is also checked
+    /// against the irq-safe locks held there.
     ///
     /// All of it is O(locks held), and the one check that needs the whole
     /// graph -- a cycle through classes this context does not hold -- is left
@@ -131,6 +137,9 @@ class ThreadLockState {
             } else {
                 record_edge(entry, held_entry, *held, *acquiring);
             }
+        }
+        if (!acquiring->has(ValidationOptions::IrqSafe)) {
+            check_irq_safety_across_states(entry);
         }
 
         // ActiveListDisabled: validated, but not kept -- for the locks that
@@ -240,6 +249,43 @@ class ThreadLockState {
                 return;
             case LockClassState::AddResult::Present:
                 return;
+        }
+    }
+
+    /// An irq-unsafe lock taken while irq-safe locks are held: the rule
+    /// record_edge() applies to a pair on one list, applied to the pair that
+    /// a split environment never lets meet on one.
+    ///
+    /// The kernel keeps irq-safe locks on the CPU's state and the rest on the
+    /// thread's, as Zircon's SystemGetThreadLockState() does, so that an
+    /// interrupt handler never changes the list of the thread it interrupted.
+    /// That split is right for recording and wrong for this question: the
+    /// held irq-safe locks sit on the other list, where the loop in acquire()
+    /// never looks, and the check it runs could not fire. Zircon has the same
+    /// gap. So the CPU's state is asked directly.
+    ///
+    /// Only the rule is checked; no edge is recorded across the states, and
+    /// none needs to be. A cycle through classes of both kinds has to step
+    /// somewhere from an irq-safe class to an irq-unsafe one, and that step is
+    /// reported here as it is taken; a cycle through one kind stays on one
+    /// state, whose edges are recorded and searched by loop_detection_pass().
+    ///
+    /// A state that is delivering a report, or holds a ReportingDisabled lock,
+    /// is not reported against, since its holder may be the reporter itself.
+    /// The read is only sound while the running thread cannot move to another
+    /// CPU: validating an irq-unsafe lock has to happen with interrupts off,
+    /// which is what the policy's ValidationGuard is for -- Zircon's Mutex and
+    /// BrwLock policies use LockValidationGuard to the same end.
+    auto check_irq_safety_across_states(AcquiredLockEntry const &entry) -> void {
+        // Not a pointer to const, though nothing is changed through it: ustl's
+        // List::back() const does not compile, returning Option<T &> where it
+        // promises Option<T const &>.
+        auto *const irq_state = system_get_thread_lock_state(ValidationOptions::IrqSafe);
+        if (irq_state == nullptr || irq_state == this || irq_state->reporting_disabled()) {
+            return;
+        }
+        if (auto const held = irq_state->m_acquired_locks.back()) {
+            report(entry, &*held, LockResult::InvalidIrqSafety);
         }
     }
 

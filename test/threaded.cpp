@@ -211,6 +211,14 @@ auto survives_concurrent_recording() -> bool {
         std::printf("    %zu slots hold one edge recorded by %d threads\n", slots, THREADS);
         return false;
     }
+
+    // Nothing here breaks a rule. This environment also keeps every lock on
+    // one state, so the look across to the irq-safe locks' state has to find
+    // that it is the state already validated, and stay quiet.
+    if (auto const reports = g_reports.load(std::memory_order_relaxed); reports != 0) {
+        std::printf("    %d reports for acquisitions that break no rule\n", reports);
+        return false;
+    }
     return true;
 }
 

@@ -26,6 +26,17 @@ class ThreadLockState;
 /// interrupted, and recording it on that thread's list would mix two
 /// contexts' acquisitions into one order.
 ///
+/// The split asks two things of the environment, both of the ValidationGuard
+/// in the lock's policy. The per-CPU list must only change with interrupts
+/// off, or a handler lands in the middle of the change: an option that takes
+/// an irq-safe lock with interrupts on -- PreemptDisable on a spin lock --
+/// has to disable them for the validation. And taking an irq-unsafe lock
+/// also reads the per-CPU list, for the irq-safe locks held there (see
+/// ThreadLockState::check_irq_safety_across_states()), which is only sound
+/// while the thread cannot move to another CPU: the policy of an irq-unsafe
+/// lock has to disable interrupts for the validation too, as Zircon's Mutex
+/// and BrwLock policies do with LockValidationGuard.
+///
 /// May return nullptr where there is no context yet -- early boot, before the
 /// first thread -- and the acquisition then goes unrecorded.
 auto system_get_thread_lock_state(ValidationOptions options) -> ThreadLockState *;

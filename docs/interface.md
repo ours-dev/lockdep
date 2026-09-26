@@ -462,6 +462,19 @@ order, for each held entry:
    went in, so an ordering that recurs is reported once rather than at every
    acquisition.
 
+and then one check Zircon leaves out: an irq-unsafe lock is checked against
+the irq-safe locks on the per-CPU state, when that is a state of its own --
+`InvalidIrqSafety` against the most recent of them. With irq-safe locks on the
+CPU's state and the rest on the thread's, the pair in step 3 never meets on
+one list, so there the check could not fire; Zircon, with the same split, has
+the same gap. Only the rule is checked across the states, never an edge, and
+none is needed: a cycle through classes of both kinds has to step somewhere
+from an irq-safe class to an irq-unsafe one, which this check reports as it
+happens, and a cycle through one kind stays on one state, where its edges are
+recorded. A state that is reporting, or holds a `ReportingDisabled` lock, is
+not reported against. An environment with a single state skips the check,
+since step 3 already covers it.
+
 `ReportingDisabled` is a counter: held `ReportingDisabled` locks, plus one for
 the duration of every report and trigger, so a reporter that takes a lock -- a
 console lock, say -- cannot recurse into another report. `ActiveListDisabled`
@@ -560,6 +573,16 @@ return the per-CPU state for irq-safe locks and the per-thread state otherwise,
 as Zircon's `lock_dep.cc` does: an irq-safe lock can be taken in interrupt
 context, where the running thread is only the interrupted one. It may return
 nullptr before there is any context, and the acquisition then goes unrecorded.
+
+The split asks two things of the environment, both met by the policies'
+`ValidationGuard`s. The per-CPU state must only change with interrupts off, so
+an option that takes an irq-safe lock with interrupts on -- `PreemptDisable` on
+a spin lock -- disables them for the validation. And taking an irq-unsafe lock
+reads the per-CPU state, which is only sound while the thread cannot move to
+another CPU, so an irq-unsafe lock's policy disables interrupts for the
+validation as well, as Zircon's `Mutex` and `BrwLock` policies do with
+`LockValidationGuard`.
+
 `system_trigger_loop_detection` only takes note; the environment runs
 `loop_detection_pass()` later on a context of its own -- detection never runs
 on the acquire path.
@@ -577,6 +600,10 @@ itself; `system_init_thread_lock_state` is left out, as a default-constructed
   policies modeled on Zircon's `kernel/include/kernel/spinlock.h`
   (`NoIrqSavePolicy`, `IrqSavePolicy`, the try-lock variants).
 - `Thread` holds a `ThreadLockState`; each CPU's local data holds another.
+- The policies' `ValidationGuard`s disable interrupts for the validation where
+  the split needs it: `Mutex` and every other irq-unsafe lock, whose
+  validation reads the per-CPU state, and every option that takes a spin lock
+  with interrupts on (`PreemptDisable`), whose validation changes it.
 - The variadic `ScopedGuard` is gone. A call site over locks of different
   classes becomes nested `Guard`s, one over several locks of one class a
   `ScopedGuard{IRQ_SAVE, a, b}`. The kernel has no call sites, only the

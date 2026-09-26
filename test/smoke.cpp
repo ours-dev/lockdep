@@ -1040,6 +1040,44 @@ auto no_locks_held_is_asserted() -> bool {
     return clean && g_fatal_count == 1;
 }
 
+// The same rule where the environment splits the states, as the kernel does:
+// the irq-safe lock is held on the CPU's state and the irq-unsafe one is taken
+// on the thread's, so the pair never meets on one list and the check has to
+// look across. irq_safety_is_checked() cannot show this: hold_as() puts every
+// lock on the thread's state. The legal order -- irq-unsafe held, irq-safe
+// taken -- stays quiet, and so does a held ReportingDisabled irq-safe lock,
+// whose holder may be the reporter itself.
+auto irq_safety_is_checked_across_states() -> bool {
+    lockdep::Lock<fake::SpinLock> spin{lockdep::lock_class<struct AcrossSpin>()};
+    lockdep::Lock<fake::SpinLock> quiet{
+        lockdep::lock_class<struct AcrossQuiet, lockdep::ValidationOptions::ReportingDisabled>()};
+    lockdep::Lock<fake::BareLock> plain{lockdep::lock_class<struct AcrossPlain>()};
+
+    reset_reports();
+    {
+        lockdep::Guard held{spin, lockdep::IRQ_SAVE};
+        lockdep::Guard taken{plain};
+    }
+    auto const reported =
+        reports_of(lockdep::LockResult::InvalidIrqSafety) == 1 && g_report_count == 1;
+
+    reset_reports();
+    {
+        lockdep::Guard held{plain};
+        lockdep::Guard taken{spin, lockdep::IRQ_SAVE};
+    }
+    auto const legal_order_quiet = g_report_count == 0;
+
+    reset_reports();
+    {
+        lockdep::Guard held{quiet, lockdep::IRQ_SAVE};
+        lockdep::Guard taken{plain};
+    }
+    auto const suppressed = g_report_count == 0;
+
+    return reported && legal_order_quiet && suppressed && !recorded();
+}
+
 // A Guard records an irq-safe lock on the CPU's state and anything else on the
 // thread's, as system_get_thread_lock_state() hands them out.
 auto states_follow_irq_safety(fake::SpinLock &irq_safe, fake::BareLock &plain) -> bool {
@@ -1112,6 +1150,7 @@ auto main() -> int {
         check("same_class_rules", same_class_rules());
         check("leaf_must_be_last", leaf_must_be_last());
         check("irq_safety_is_checked", irq_safety_is_checked());
+        check("irq_safety_is_checked_across_states", irq_safety_is_checked_across_states());
         check("reporting_disabled_suspends_reports", reporting_disabled_suspends_reports());
         check("reporter_cannot_recurse", reporter_cannot_recurse());
         check("active_list_disabled", active_list_disabled());
