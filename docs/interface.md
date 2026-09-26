@@ -49,7 +49,7 @@ file names, and `std::` facilities over ustl wrappers.
 | `lockdep/config.hpp` | `common.h` | feature level, `LockClassId`, `LockResult`, limits |
 | `lockdep/lock_traits.hpp` | `lock_traits.h` | `ValidationOptions`, `lockdep_traits` lookup |
 | `lockdep/lock_policy.hpp` | `lock_policy.h` | option tags, the `LockPolicy` concept, `lockdep_policy` lookup |
-| `lockdep/lock_class.hpp` | `lock_class.h` | `class_id<Tag>()`, `Lock<T>`, `SingletonLock` |
+| `lockdep/lock_class.hpp` | `lock_class.h` | `lock_class<Tag>()`, `Lock<T>` |
 | `lockdep/guard.hpp` | `guard.h` | `Guard`, `NullGuard`, `assert_held` |
 | `lockdep/guard_multiple.hpp` | `guard_multiple.h` | `GuardMultiple` |
 | `lockdep/thread_lock_state.hpp` | `thread_lock_state.h` | `AcquiredLockEntry`, `ThreadLockState`, `assert_no_locks_held` |
@@ -199,26 +199,40 @@ second interface: nothing new should be declared through them.
 
 ## Lock classes — `lock_class.hpp`
 
-A class is named by a tag type. `class_id<Tag, Flags>()` returns the address of
-a static state object that exists once per instantiation, exactly like
-Zircon's `LockClassStateStorage::lock_class_state_`:
+A lock class belongs to a **(tag, lock type)** pair. The declaration names the
+tag, and may add options; the lock type contributes its own options, the ones
+every lock of its kind has — every `SpinLock` is `IrqSafe`. The class's options
+are the union of the two, and only the place where both are known can make it:
+the `Lock<T>` constructor. So the declaration passes a name, not an id:
 
 ```cpp
-template <typename Tag, ValidationOptions Flags = ValidationOptions::None>
-constexpr auto class_id() -> LockClassId;
+template <typename Tag, ValidationOptions Options = ValidationOptions::None>
+constexpr auto lock_class() -> LockClassName<Tag, Options>;   // an empty token
 ```
+
+and `Lock<T>` turns the token into the class of `(Tag, T)`, whose state object
+exists once per instantiation and whose address is the id, exactly like
+Zircon's `LockClassStateStorage::lock_class_state_`. Zircon keys `LockClass`
+on the lock type for the same reason. The merged options are checked there
+too: `MultiAcquire` excludes `Nestable` and `ReAcquireFatal`, as in Zircon's
+`DefaultLockFlags`.
+
+An earlier draft had the declaration call `class_id<Tag>()` and hand the
+resulting id to the lock. That id could only carry the tag's options, so every
+`SpinLock` declaration would have had to repeat `IrqSafe` by hand, and one tag
+used on two lock types would silently have been one class.
 
 A lock is the underlying lock **plus** its class id — composition, no base
 class:
 
 ```cpp
 template <typename LockType>
-class Lock {
+class TA_CAPABILITY("lock") Lock {
   public:
-    template <typename... Args>
-    constexpr explicit Lock(LockClassId id, Args &&...args);
+    template <typename Tag, ValidationOptions Options, typename... Args>
+    constexpr explicit Lock(LockClassName<Tag, Options>, Args &&...args);
 
-    auto lock() -> LockType &;
+    auto lock() -> LockType &;                  // TA_RETURN_CAPABILITY(*this)
     auto lock() const -> LockType const &;
     constexpr auto id() const -> LockClassId;   // INVALID_LOCK_CLASS_ID when metadata is off
 
@@ -227,7 +241,7 @@ class Lock {
 
   private:
     LockType m_lock;
-    [[no_unique_address]] ClassIdStorage m_id;  // empty when metadata is off
+    [[no_unique_address]] ClassIdHolder m_id;   // empty when metadata is off
 };
 ```
 
@@ -235,10 +249,14 @@ Declaring a lock names its class at the declaration:
 
 ```cpp
 class Thread {
-    lockdep::Lock<sync::SpinLock> m_pi_lock{lockdep::class_id<struct ThreadPiLock>()};
-    lockdep::Lock<sync::SpinLock> m_task_lock{lockdep::class_id<struct ThreadTaskLock>()};
+    lockdep::Lock<sync::SpinLock> m_pi_lock{lockdep::lock_class<struct ThreadPiLock>()};
+    lockdep::Lock<sync::SpinLock> m_task_lock{
+        lockdep::lock_class<struct ThreadTaskLock, lockdep::ValidationOptions::Leaf>()};
 };
 ```
+
+`lock_class` is a function rather than a variable template only because a
+constexpr variable is named in `UPPER_CASE` here.
 
 How this differs from Zircon, and why:
 
@@ -253,20 +271,16 @@ How this differs from Zircon, and why:
   syntax, and its name is what a report prints — `ThreadPiLock` reads better
   than `Thread:142`.
 
-Global locks:
+The `Lock` is the capability the thread-safety analysis sees: members are
+`TA_GUARDED(m_lock)` with `m_lock` the `Lock`, and `lock()` returns the inner
+lock as that same capability, so taking the inner lock through it balances.
 
-```cpp
-template <typename Tag, typename LockType, ValidationOptions Flags = ValidationOptions::None>
-class SingletonLock {
-  public:
-    static auto get() -> Lock<LockType> &;
-};
-```
-
-This is Zircon's `SingletonLockDep` without the CRTP: the tag is a template
-argument rather than the derived type. Zircon's
-`LOCK_DEP_SINGLETON_LOCK_WRAPPER` (wrapping a C global) is left out until
-something needs it.
+Global locks are plain `Lock<T>` objects at namespace scope. When the inner
+lock is constant-constructible they are `constinit`, class id included, which
+keeps them out of static-initialisation order. Zircon's `SingletonLockDep`
+adds a `Get()` accessor and the `SingletonLock` option on top of that; nothing
+here needs either yet, so it is left out until something does, along with
+`LOCK_DEP_SINGLETON_LOCK_WRAPPER`.
 
 ## Guards — `guard.hpp`
 

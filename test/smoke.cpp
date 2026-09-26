@@ -290,6 +290,62 @@ static_assert(
     lockdep::LockPolicy<lockdep::PolicyFor<fake::SpinLock, lockdep::IrqSave>, fake::SpinLock>,
     "a state saver is presented as a complete policy");
 
+// --- locks named at their declaration ----------------------------------------
+
+// A type that owns locks the way kernel objects will: each declaration names
+// its own class, with a tag declared on the spot.
+struct Owner {
+    lockdep::Lock<fake::SpinLock> m_first{lockdep::lock_class<struct OwnerFirstLock>()};
+    lockdep::Lock<fake::SpinLock> m_second{
+        lockdep::lock_class<struct OwnerSecondLock, lockdep::ValidationOptions::Leaf>()};
+    // The same tag as m_first, on another lock type: a class of its own.
+    lockdep::Lock<fake::BareLock> m_bare{lockdep::lock_class<struct OwnerFirstLock>()};
+};
+
+// A lock with static storage duration is constant-initialised, class id and
+// all -- which is what keeps global locks out of static-initialisation order.
+constinit lockdep::Lock<fake::BareLock> g_constant_lock{lockdep::lock_class<struct ConstantLock>()};
+
+static_assert(lockdep::LOCK_METADATA_AVAILABLE ||
+                  sizeof(lockdep::Lock<fake::SpinLock>) == sizeof(fake::SpinLock),
+              "without metadata a Lock costs exactly what its inner lock costs");
+
+auto options_of(lockdep::LockClassId const id) -> lockdep::ValidationOptions {
+    return static_cast<lockdep::MetadataLockClassState const *>(id)->options();
+}
+
+auto named_classes() -> bool {
+    Owner const one;
+    Owner const two;
+    if constexpr (!lockdep::LOCK_METADATA_AVAILABLE) {
+        return one.m_first.id() == lockdep::INVALID_LOCK_CLASS_ID &&
+               g_constant_lock.id() == lockdep::INVALID_LOCK_CLASS_ID;
+    } else {
+        auto const irq_safe = lockdep::ValidationOptions::IrqSafe;
+        auto const leaf = lockdep::ValidationOptions::Leaf;
+        return one.m_first.id() != lockdep::INVALID_LOCK_CLASS_ID &&
+               // Two declarations, two classes.
+               one.m_first.id() != one.m_second.id() &&
+               // One declaration, one class, however many objects.
+               one.m_first.id() == two.m_first.id() &&
+               // One tag on two lock types, two classes.
+               one.m_first.id() != one.m_bare.id() &&
+               // The lock type's options, and the declaration's on top.
+               options_of(one.m_first.id()) == irq_safe &&
+               options_of(one.m_second.id()) == (irq_safe | leaf) &&
+               g_constant_lock.id() != lockdep::INVALID_LOCK_CLASS_ID;
+    }
+}
+
+// lock() hands out the inner lock as the Lock's own capability, so taking it
+// through lock() is balanced to -Wthread-safety.
+auto annotated_through_lock() -> bool {
+    lockdep::Lock<fake::AnnotatedLock> lock{lockdep::lock_class<struct AnnotatedWrapped>()};
+    lock.lock().acquire();
+    lock.lock().release();
+    return true;
+}
+
 // --- lock classes ------------------------------------------------------------
 
 static_assert(lockdep::LOCK_METADATA_AVAILABLE ==
@@ -638,6 +694,8 @@ auto main() -> int {
     fake::AnnotatedLock annotated;
 
     check("class_ids_are_distinct", class_ids_are_distinct());
+    check("named_classes", named_classes());
+    check("annotated_through_lock", annotated_through_lock());
     check("plain_guard", plain_guard(a));
     check("irq_guard", irq_guard(a));
     check("combined_guard", combined_guard(a));
