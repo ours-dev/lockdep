@@ -11,7 +11,6 @@
 #include <lockdep/thread_lock_state.hpp>
 
 #include <optional>
-#include <tuple>
 #include <utility>
 
 #include <ours/compiler.hpp>
@@ -81,7 +80,7 @@ namespace priv {
 ///
 /// Two locks of one class held at once read to the validator as a mistake
 /// unless the second one's order rises above the first's. A Nestable class
-/// supplies the order itself -- a depth in a tree, say -- and GuardMultiple
+/// supplies the order itself -- a depth in a tree, say -- and ScopedGuard
 /// uses the locks' addresses. A strong type rather than a bare integer, so
 /// that `Guard guard{lock, LockOrder{2}}` cannot be confused with the
 /// option-tag form `Guard guard{lock, IRQ_SAVE}`.
@@ -385,20 +384,30 @@ Guard(LockType &, Option) -> Guard<LockType, Option>;
 /// held by a Guard whose LockOrder is its address, so the validator checks
 /// the order rises. Zircon's GuardMultiple (lockdep/guard_multiple.h).
 ///
+/// Named after std::scoped_lock, the standard's guard over several locks, but
+/// not built on its algorithm. std::scoped_lock avoids deadlock through
+/// std::lock -- take one lock, try the others, and on a failure drop them all
+/// and start over -- so one set of locks may be taken in a different order on
+/// every attempt. Lockdep would see the same locks taken in both orders and
+/// report them. Linux's lockdep could live with that, as it records no
+/// dependency for a try-lock (validate_chain() in kernel/locking/lockdep.c),
+/// but only by leaving every lock but the one it blocks on unchecked. A fixed
+/// order keeps them all checked.
+///
 /// Meant for locks of one class. Locks of different classes are nested Guards,
 /// whose order is exactly what the validator is there to check; given here,
 /// they are taken in address order and validated as such.
 template <usize Count, typename LockType, typename Option = NoOption>
-class GuardMultiple {
-    using Self = GuardMultiple;
+class ScopedGuard {
+    using Self = ScopedGuard;
 
-    static_assert(Count > 0, "GuardMultiple needs at least one lock");
+    static_assert(Count > 0, "ScopedGuard needs at least one lock");
 
     /// The same restriction as Zircon's: a Nestable class orders its locks
     /// itself, and mixing that order with the address order would compare two
     /// unrelated sequences.
     static_assert(!priv::has_option(LockValidationOptionsV<LockType>, ValidationOptions::Nestable),
-                  "a Nestable lock type is ordered by its own orders, not by GuardMultiple");
+                  "a Nestable lock type is ordered by its own orders, not by ScopedGuard");
 
   public:
     /// Excluded from the thread-safety analysis, as Zircon's GuardMultiple is:
@@ -406,7 +415,7 @@ class GuardMultiple {
     /// analysis cannot follow them.
     template <typename... Locks>
         requires(sizeof...(Locks) == Count && (std::is_same_v<Locks, Lock<LockType>> && ...))
-    TA_NO_THREAD_SAFETY_ANALYSIS explicit GuardMultiple(Locks &...locks) {
+    TA_NO_THREAD_SAFETY_ANALYSIS explicit ScopedGuard(Locks &...locks) {
         Lock<LockType> *sorted[Count] = {&locks...};
         sort_by_address(sorted);
         for (usize i = 0; i < Count; ++i) {
@@ -416,7 +425,7 @@ class GuardMultiple {
 
     /// Released in the reverse of the acquisition order, highest address
     /// first. The array's own destruction runs in that order too.
-    TA_NO_THREAD_SAFETY_ANALYSIS ~GuardMultiple() {
+    TA_NO_THREAD_SAFETY_ANALYSIS ~ScopedGuard() {
         release();
     }
 
@@ -439,7 +448,7 @@ class GuardMultiple {
     }
 
   private:
-    USTL_NO_MOVEABLE_AND_COPYABLE(GuardMultiple);
+    USTL_NO_MOVEABLE_AND_COPYABLE(ScopedGuard);
 
     /// Insertion sort: Count is a handful, and for two it is one compare and
     /// swap.
@@ -460,54 +469,6 @@ class GuardMultiple {
     /// construct each in place, where Zircon uses a union.
     std::optional<Guard<LockType, Option>> m_guards[Count];
 };
-
-/// Holds several locks for one scope.
-///
-/// Acquires them left to right and releases them right to left, so a
-/// caller only has to state the order once and nesting stays consistent
-/// with what a stack of single Guards would have done.
-///
-/// The bodies used to be declared and never defined, which made every use
-/// an undefined symbol at link time.
-///
-/// Invisible to the thread-safety analysis: a capability attribute cannot
-/// name a parameter pack, so there is no way to write TA_ACQUIRE(locks...).
-/// The bodies are excluded from analysis so that the raw acquire()/release()
-/// calls inside them do not trip it; callers who need the analysis to see
-/// the locks should nest single Guards instead.
-///
-/// Invisible to lockdep's validation for the same practical reason, and on
-/// its way out: docs/interface.md replaces it with nested Guards for locks of
-/// different classes and GuardMultiple for locks of one class.
-template <typename... LockTypes>
-class ScopedGuard {
-  public:
-    TA_NO_THREAD_SAFETY_ANALYSIS explicit ScopedGuard(LockTypes &&...locks) : m_locks(locks...) {
-        // The lambda is its own function to the analysis; the attribute on
-        // the constructor does not reach into it.
-        std::apply([](auto &...lock) TA_NO_THREAD_SAFETY_ANALYSIS { (lock.acquire(), ...); },
-                   m_locks);
-    }
-
-    TA_NO_THREAD_SAFETY_ANALYSIS ~ScopedGuard() {
-        release(std::index_sequence_for<LockTypes...>{});
-    }
-
-  private:
-    USTL_NO_MOVEABLE_AND_COPYABLE(ScopedGuard);
-
-    /// Reverse of the acquisition order: index i releases element N-1-i.
-    template <usize... Is>
-    TA_NO_THREAD_SAFETY_ANALYSIS auto release(std::index_sequence<Is...>) -> void {
-        constexpr auto COUNT = sizeof...(Is);
-        (std::get<COUNT - 1 - Is>(m_locks).release(), ...);
-    }
-
-    std::tuple<LockTypes...> m_locks;
-};
-
-template <typename... LockType>
-ScopedGuard(LockType &&...) -> ScopedGuard<LockType...>;
 
 } // namespace lockdep
 

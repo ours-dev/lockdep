@@ -505,7 +505,7 @@ auto ordered_guards() -> bool {
     }
 }
 
-// Three locks of one class, as a GuardMultiple sees them.
+// Three locks of one class, as a ScopedGuard sees them.
 struct Buckets {
     lockdep::Lock<fake::SequencedLock> m_first{lockdep::lock_class<struct Bucket>()};
     lockdep::Lock<fake::SequencedLock> m_second{lockdep::lock_class<struct Bucket>()};
@@ -515,36 +515,35 @@ struct Buckets {
 // Taken in address order whatever order they are given in, so two call sites
 // listing the same locks differently agree -- and the validator sees one class
 // held three times with rising orders, which is no violation.
-auto guard_multiple_takes_address_order() -> bool {
+auto scoped_guard_takes_address_order() -> bool {
     Buckets buckets;
     reset_reports();
     fake::g_sequence_length = 0;
     auto all_held = false;
     {
-        lockdep::GuardMultiple<3, fake::SequencedLock> guard{buckets.m_third, buckets.m_first,
-                                                             buckets.m_second};
+        lockdep::ScopedGuard<3, fake::SequencedLock> guard{buckets.m_third, buckets.m_first,
+                                                           buckets.m_second};
         all_held = static_cast<bool>(guard);
     }
     auto const ascending = fake::g_sequence_length == 3 &&
                            fake::g_sequence[0] < fake::g_sequence[1] &&
                            fake::g_sequence[1] < fake::g_sequence[2];
     {
-        lockdep::GuardMultiple<3, fake::SequencedLock> guard{buckets.m_second, buckets.m_third,
-                                                             buckets.m_first};
+        lockdep::ScopedGuard<3, fake::SequencedLock> guard{buckets.m_second, buckets.m_third,
+                                                           buckets.m_first};
     }
     return all_held && ascending && g_report_count == 0 && !recorded();
 }
 
 // The option applies to each lock: every saver is held while the group is.
-auto guard_multiple_with_option() -> bool {
+auto scoped_guard_with_option() -> bool {
     struct Pair {
         lockdep::Lock<fake::SpinLock> m_left{lockdep::lock_class<struct PairLock>()};
         lockdep::Lock<fake::SpinLock> m_right{lockdep::lock_class<struct PairLock>()};
     } pair;
     auto saved = false;
     {
-        lockdep::GuardMultiple<2, fake::SpinLock, lockdep::IrqSave> guard{pair.m_left,
-                                                                          pair.m_right};
+        lockdep::ScopedGuard<2, fake::SpinLock, lockdep::IrqSave> guard{pair.m_left, pair.m_right};
         saved = fake::g_irq_depth == 2;
     }
     return saved && fake::g_irq_depth == 0;
@@ -710,11 +709,6 @@ auto failed_try_lock() -> bool {
     constexpr auto V = lockdep::LOCK_VALIDATION_ENABLED;
     bool const recorded[] = {false, V};
     return nothing_left && trace_is("pa", recorded);
-}
-
-auto scoped_guard(fake::SpinLock &a, fake::SpinLock &b) -> bool {
-    lockdep::ScopedGuard guard{a, b};
-    return a.held && b.held;
 }
 
 auto void_guard() -> bool {
@@ -1054,7 +1048,6 @@ auto check(char const *name, bool ok) -> void {
 
 auto main() -> int {
     fake::SpinLock a;
-    fake::SpinLock b;
     fake::BareLock bare;
     fake::StrictLock strict;
     fake::AnnotatedLock annotated;
@@ -1069,8 +1062,8 @@ auto main() -> int {
     check("call_unlocked_drops_and_retakes", call_unlocked_drops_and_retakes(a));
     check("call_untracked_keeps_the_lock", call_untracked_keeps_the_lock(a));
     check("ordered_guards", ordered_guards());
-    check("guard_multiple_takes_address_order", guard_multiple_takes_address_order());
-    check("guard_multiple_with_option", guard_multiple_with_option());
+    check("scoped_guard_takes_address_order", scoped_guard_takes_address_order());
+    check("scoped_guard_with_option", scoped_guard_with_option());
     check("plain_guard", plain_guard(a));
     check("irq_guard", irq_guard(a));
     check("combined_guard", combined_guard(a));
@@ -1082,7 +1075,6 @@ auto main() -> int {
     check("unguard_keeps_saved_state", unguard_keeps_saved_state(a));
     check("policy_order", policy_order());
     check("failed_try_lock", failed_try_lock());
-    check("scoped_guard", scoped_guard(a, b));
     check("void_guard", void_guard());
 
     check("savers unwound", fake::g_irq_depth == 0 && fake::g_preempt_depth == 0);

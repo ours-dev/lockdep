@@ -5,11 +5,13 @@ lockdep (`fuchsia/src/lib/lockdep/include/lockdep/`, kernel glue in
 `fuchsia/zircon/kernel/lib/lockdep/lock_dep.cc`). The current headers predate
 it and are to be reshaped to match.
 
-Three choices below were put to the maintainer and settled rather than
+Four choices below were put to the maintainer and settled rather than
 inferred: a lock's class is named by a tag type, not by Zircon's `__LINE__`
 macro; `Guard` accepts only `lockdep::Lock<T>`, with no transitional overload
-for raw locks; and releasing a guard early restores what its policy saved at
-that point, as Zircon's `Guard::Release()` does, not at the end of the scope.
+for raw locks; releasing a guard early restores what its policy saved at
+that point, as Zircon's `Guard::Release()` does, not at the end of the scope;
+and the guard over several locks of one class is called `ScopedGuard`, after
+`std::scoped_lock`, rather than Zircon's `GuardMultiple`.
 
 Where the design keeps Zircon's shape the Zircon file is cited so the two can
 be compared. Where it departs, the reason is given — usually one of this
@@ -34,9 +36,10 @@ file names, and `std::` facilities over ustl wrappers.
    acquisition, or an interrupt landing in between sees the lock as already
    held. Zircon's `LockPolicy` (`lock_policy.h`) owns all four steps; savers
    are a strict subset of it.
-3. **`ScopedGuard` duplicates `Guard`** and cannot carry an option. Zircon has
-   no such type: different classes are nested `Guard`s, and several locks of
-   one class go through `GuardMultiple`, which orders them by address.
+3. **The variadic `ScopedGuard` duplicates `Guard`** and cannot carry an
+   option. Zircon has no such type: different classes are nested `Guard`s, and
+   several locks of one class go through `GuardMultiple`, which orders them by
+   address. That guard takes over the name `ScopedGuard` here.
 4. **One context per thread is not enough.** A lock taken from interrupt
    context must not land on the interrupted thread's held list. Zircon selects
    the list by the lock's flags (`SystemGetThreadLockState(LockFlags)`: per-CPU
@@ -51,8 +54,7 @@ file names, and `std::` facilities over ustl wrappers.
 | `lockdep/lock_traits.hpp` | `lock_traits.h` | `ValidationOptions`, `lockdep_traits` lookup |
 | `lockdep/lock_policy.hpp` | `lock_policy.h` | option tags, the `LockPolicy` concept, `lockdep_policy` lookup |
 | `lockdep/lock_class.hpp` | `lock_class.h` | `lock_class<Tag>()`, `Lock<T>` |
-| `lockdep/guard.hpp` | `guard.h` | `Guard`, `NullGuard`, `assert_held` |
-| `lockdep/guard_multiple.hpp` | `guard_multiple.h` | `GuardMultiple` |
+| `lockdep/guard.hpp` | `guard.h`, `guard_multiple.h` | `Guard`, `ScopedGuard`, `NullGuard`, `assert_held` |
 | `lockdep/thread_lock_state.hpp` | `thread_lock_state.h` | `AcquiredLockEntry`, `ThreadLockState`, `assert_no_locks_held` |
 | `lockdep/lock_class_state.hpp` | `lock_class_state.h` | `LockClassState`, the graph node, `loop_detection_pass()` |
 | `lockdep/runtime_api.hpp` | `runtime_api.h` | what the environment must define |
@@ -349,21 +351,33 @@ lock is never meaningful; the shared-mode specialisation, `AliasedLock` and
 `AssertOrderedLock` are left out until a reader-writer lock or type-erased
 nestable lock needs them.
 
-## Several locks of one class — `guard_multiple.hpp`
+## Several locks of one class — `ScopedGuard` in `guard.hpp`
 
 ```cpp
 template <usize Count, typename LockType, typename Option = NoOption>
-class GuardMultiple {
+class ScopedGuard {
   public:
-    explicit GuardMultiple(Lock<LockType> &...locks);   // Count of them, of one class
+    explicit ScopedGuard(Lock<LockType> &...locks);   // Count of them, of one class
     auto release() -> void;
     explicit operator bool() const;
 };
 ```
 
 Takes the locks in address order, so any two sites locking the same set agree
-on the order. Replaces `ScopedGuard`; locks of *different* classes are simply
-nested `Guard`s, whose order is exactly what lockdep is there to check.
+on the order. Locks of *different* classes are simply nested `Guard`s, whose
+order is exactly what lockdep is there to check.
+
+The name is `std::scoped_lock`'s, the standard's guard over several locks; the
+algorithm is not. `std::scoped_lock` avoids deadlock through `std::lock`: take
+one lock, try the others, and on a failure drop them all and start over. One
+set of locks may then be taken in a different order on every attempt, and
+lockdep, seeing the same locks taken in both orders, would report them. Linux's
+lockdep could live with that, as it records no dependency for a try-lock
+(`validate_chain()` in `kernel/locking/lockdep.c`), but only by leaving every
+lock but the one it blocks on unchecked; a fixed order keeps them all checked.
+The name used to belong to a variadic guard that took its locks in argument
+order, unseen by both lockdep and the thread-safety analysis; that guard is
+gone.
 
 Each lock is held by an ordered `Guard` whose `LockOrder` is its address, so
 the validator sees one class held several times with rising orders -- no
@@ -533,7 +547,11 @@ itself; `system_init_thread_lock_state` is left out, as a default-constructed
   policies modeled on Zircon's `kernel/include/kernel/spinlock.h`
   (`NoIrqSavePolicy`, `IrqSavePolicy`, the try-lock variants).
 - `Thread` holds a `ThreadLockState`; each CPU's local data holds another.
-- `ScopedGuard` call sites become nested `Guard`s.
+- The variadic `ScopedGuard` is gone. A call site over locks of different
+  classes becomes nested `Guard`s, one over several locks of one class a
+  `ScopedGuard<N, T, Option>`. The kernel has no call sites, only the
+  re-export in `ours/lockdep.hpp`, which now names the new guard, and a
+  comment in `Scheduler::tick_thread` that still describes the old one.
 
 ## Layout
 
