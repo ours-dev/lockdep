@@ -58,6 +58,45 @@ namespace priv {
         static constexpr char const *VALUE = STORAGE.data();
     };
 
+    /// The smallest prime from a short table that is at least |n| -- Zircon's
+    /// NextPrime() (lockdep/common.h), and the same table. Each step is a
+    /// little under double the one before and as far as it can be from the
+    /// powers of two either side; 0 when |n| is beyond the table.
+    constexpr auto next_prime(usize const n) -> usize {
+        if (n < (1U << 4)) {
+            return 23;
+        }
+        if (n < (1U << 5)) {
+            return 53;
+        }
+        if (n < (1U << 6)) {
+            return 97;
+        }
+        if (n < (1U << 7)) {
+            return 193;
+        }
+        if (n < (1U << 8)) {
+            return 389;
+        }
+        if (n < (1U << 9)) {
+            return 769;
+        }
+        if (n < (1U << 10)) {
+            return 1543;
+        }
+        return 0;
+    }
+
+} // namespace priv
+
+/// How many slots each class's dependency set has: LOCKDEP_MAX_DEPENDENCIES
+/// raised to a prime. The set is hashed by the address of a class state, and
+/// those addresses are all aligned alike; taken modulo a power of two they
+/// would crowd into a few slots, modulo a prime they spread.
+constexpr usize DEPENDENCY_SET_CAPACITY = priv::next_prime(MAX_DEPENDENCIES);
+static_assert(DEPENDENCY_SET_CAPACITY != 0, "LOCKDEP_MAX_DEPENDENCIES is beyond the prime table");
+
+namespace priv {
     enum class AddResult {
         /// The edge is new: the graph changed.
         Added,
@@ -70,6 +109,95 @@ namespace priv {
         Full,
     };
 
+    /// The successors of one lock class: a lock-free, wait-free hash set of
+    /// class states. Zircon's LockDependencySet (lockdep/lock_dependency_set.h).
+    ///
+    /// Open addressing with linear probing over a fixed array, whose slots only
+    /// ever change from empty to holding a class and never back. That one
+    /// invariant carries the rest:
+    ///
+    ///   - a lookup stops at the first empty slot, since nothing it looks for
+    ///     can lie beyond a slot that has never been filled;
+    ///   - an insertion claims the first empty slot with a compare-exchange;
+    ///     losing the race to the same class means the edge is present, losing
+    ///     it to another means the probe carries on -- so an edge recorded by
+    ///     several CPUs at once takes exactly one slot;
+    ///   - the set is full only once every slot has been probed.
+    ///
+    /// All of it is relaxed, as in Zircon. The only thing one CPU publishes to
+    /// another is the pointer itself, and what it points at is a class state
+    /// with static storage, constant-initialised before anything runs; nothing
+    /// is read through the pointer that its store would have to order.
+    class DependencySet {
+        using Slot = std::atomic<LockClassState *>;
+
+      public:
+        constexpr DependencySet() = default;
+
+        DependencySet(DependencySet const &) = delete;
+        auto operator=(DependencySet const &) -> DependencySet & = delete;
+
+        [[nodiscard]]
+        auto contains(LockClassState const *const state) const -> bool {
+            for (usize probe = 0; probe < DEPENDENCY_SET_CAPACITY; ++probe) {
+                auto const *const held = slot_for(state, probe).load(std::memory_order_relaxed);
+                if (held == state) {
+                    return true;
+                }
+                if (held == nullptr) {
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        auto insert(LockClassState *const state) -> AddResult {
+            for (usize probe = 0; probe < DEPENDENCY_SET_CAPACITY; ++probe) {
+                auto &slot = slot_for(state, probe);
+                auto *held = slot.load(std::memory_order_relaxed);
+                if (held == state) {
+                    return AddResult::Present;
+                }
+                // Retried only while the slot still reads empty: a spurious
+                // failure of the weak exchange, not a lost race.
+                while (held == nullptr) {
+                    if (slot.compare_exchange_weak(held, state, std::memory_order_relaxed,
+                                                   std::memory_order_relaxed)) {
+                        return AddResult::Added;
+                    }
+                    if (held == state) {
+                        return AddResult::Present;
+                    }
+                }
+            }
+            return AddResult::Full;
+        }
+
+        /// The class in |slot|, or nullptr if the slot is empty: how the loop
+        /// detector walks the set.
+        [[nodiscard]]
+        auto at(usize const slot) const -> LockClassState * {
+            return m_slots[slot].load(std::memory_order_relaxed);
+        }
+
+      private:
+        /// Zircon's trivial hash: the address, plus the probe, modulo the prime
+        /// capacity.
+        auto slot_for(LockClassState const *const state, usize const probe) -> Slot & {
+            return m_slots[index_of(state, probe)];
+        }
+
+        auto slot_for(LockClassState const *const state, usize const probe) const -> Slot const & {
+            return m_slots[index_of(state, probe)];
+        }
+
+        static auto index_of(LockClassState const *const state, usize const probe) -> usize {
+            return (reinterpret_cast<usize>(state) + probe) % DEPENDENCY_SET_CAPACITY;
+        }
+
+        Slot m_slots[DEPENDENCY_SET_CAPACITY]{};
+    };
+
     /// A lock class's node in the lock-order graph: the part of its state that
     /// only validation needs.
     ///
@@ -80,7 +208,7 @@ namespace priv {
     ///
     /// Edges are recorded from inside the acquire path, so nothing here
     /// allocates, takes a lock, or walks the whole graph: the successors are a
-    /// fixed-capacity array and the registry of nodes is a lock-free stack. The
+    /// lock-free hash set and the registry of nodes is a lock-free stack. The
     /// walk that finds cycles is LoopDetector, run off the acquire path.
     class GraphNode {
       public:
@@ -118,30 +246,21 @@ namespace priv {
                                                        std::memory_order_relaxed));
         }
 
-        /// Number of successors recorded so far, clamped to the capacity.
+        /// How many slots the successor set has, and the class in one of them
+        /// or nullptr: what the loop detector walks.
         [[nodiscard]]
-        auto dependency_count() const -> usize {
-            auto const count = m_dependency_count.load(std::memory_order_acquire);
-            if (count < MAX_DEPENDENCIES) {
-                return count;
-            }
-            return MAX_DEPENDENCIES;
+        static constexpr auto dependency_slots() -> usize {
+            return DEPENDENCY_SET_CAPACITY;
         }
 
         [[nodiscard]]
-        auto dependency_at(usize const index) const -> LockClassState * {
-            return m_dependencies[index].load(std::memory_order_acquire);
+        auto dependency_at(usize const slot) const -> LockClassState * {
+            return m_dependencies.at(slot);
         }
 
         [[nodiscard]]
         auto has_dependency(LockClassState const *const dependency) const -> bool {
-            auto const count = dependency_count();
-            for (usize i = 0; i < count; ++i) {
-                if (dependency_at(i) == dependency) {
-                    return true;
-                }
-            }
-            return false;
+            return m_dependencies.contains(dependency);
         }
 
         /// Records the edge to |dependency|.
@@ -150,21 +269,10 @@ namespace priv {
         /// edge can have changed what is true of the graph, so only then does
         /// it check the pair and ask for a loop-detection pass. That is
         /// Zircon's AddLockClass() returning Success versus DependencyExists.
-        ///
-        /// Two contexts recording the same edge at once can both miss the
-        /// duplicate check, take two slots and both see Added. That wastes
-        /// capacity and repeats a check, but does not change what the detector
-        /// concludes.
+        /// The set makes the answer exact even under a race: an edge recorded
+        /// by several CPUs at once is Added for exactly one of them.
         auto add_dependency(LockClassState *const dependency) -> AddResult {
-            if (has_dependency(dependency)) {
-                return AddResult::Present;
-            }
-            auto const slot = m_dependency_count.fetch_add(1, std::memory_order_acq_rel);
-            if (slot >= MAX_DEPENDENCIES) {
-                return AddResult::Full;
-            }
-            m_dependencies[slot].store(dependency, std::memory_order_release);
-            return AddResult::Added;
+            return m_dependencies.insert(dependency);
         }
 
       private:
@@ -179,8 +287,7 @@ namespace priv {
 
         /// Append-only: an edge is never withdrawn, because an ordering
         /// observed once stays a fact about the code.
-        std::atomic<usize> m_dependency_count{0};
-        std::atomic<LockClassState *> m_dependencies[MAX_DEPENDENCIES]{};
+        DependencySet m_dependencies;
 
         /// Scratch space for LoopDetector. It lives in the node so the walk
         /// needs no stack of its own: `parent` is the depth-first call stack
@@ -194,7 +301,7 @@ namespace priv {
             usize index{0};
             usize least{0};
 
-            /// Next successor to visit, so the walk can resume after
+            /// Next successor slot to visit, so the walk can resume after
             /// descending.
             usize cursor{0};
 
@@ -225,7 +332,7 @@ namespace priv {
         auto ensure_registered(LockClassState &) -> void {}
 
         [[nodiscard]]
-        auto dependency_count() const -> usize {
+        static constexpr auto dependency_slots() -> usize {
             return 0;
         }
 
@@ -326,13 +433,13 @@ class LockClassState {
     }
 
     [[nodiscard]]
-    auto dependency_count() const -> usize {
-        return m_graph.dependency_count();
+    static constexpr auto dependency_slots() -> usize {
+        return Graph::dependency_slots();
     }
 
     [[nodiscard]]
-    auto dependency_at(usize const index) const -> Self * {
-        return m_graph.dependency_at(index);
+    auto dependency_at(usize const slot) const -> Self * {
+        return m_graph.dependency_at(slot);
     }
 
     [[nodiscard]]
@@ -466,7 +573,7 @@ namespace priv {
 
             while (current != nullptr) {
                 auto *const state = current->state;
-                if (current->cursor < state->dependency_count()) {
+                if (current->cursor < LockClassState::dependency_slots()) {
                     auto *const successor = state->dependency_at(current->cursor);
                     ++current->cursor;
                     if (successor == nullptr) {

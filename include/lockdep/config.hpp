@@ -5,13 +5,15 @@
 
 #include <type_traits>
 
-/// How many distinct classes one lock class may be recorded as preceding.
+/// Roughly how many distinct classes one lock class may be recorded as
+/// preceding; the dependency set rounds it up to a prime (see
+/// DEPENDENCY_SET_CAPACITY).
 ///
-/// The dependency set is a fixed array so that recording an edge never
-/// allocates -- edges are recorded from inside the acquire path, where
-/// allocating is not an option. Overflowing it costs completeness, not
-/// soundness: the overflowing edge is reported and dropped. Zircon's
-/// counterpart is LOCK_DEP_MAX_DEPENDENCIES in lockdep/common.h.
+/// The set is a fixed array so that recording an edge never allocates --
+/// edges are recorded from inside the acquire path, where allocating is not an
+/// option. Overflowing it costs completeness, not soundness: the overflowing
+/// edge is reported and dropped. Zircon's counterpart is
+/// LOCK_DEP_MAX_DEPENDENCIES in lockdep/common.h.
 #ifndef LOCKDEP_MAX_DEPENDENCIES
 #define LOCKDEP_MAX_DEPENDENCIES 32
 #endif

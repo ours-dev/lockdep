@@ -199,10 +199,16 @@ auto survives_concurrent_recording() -> bool {
         return false;
     }
 
-    // A racing duplicate costs a slot but must not multiply without bound.
-    auto const count = stress->dependency_count();
-    if (count > THREADS) {
-        std::printf("    %zu slots used for one edge under %d threads\n", count, THREADS);
+    // Exactly one slot, however many threads raced to add it: a thread that
+    // loses the compare-exchange to the same class sees the edge as present.
+    usize slots = 0;
+    for (usize i = 0; i < lockdep::LockClassState::dependency_slots(); ++i) {
+        if (stress->dependency_at(i) == target) {
+            ++slots;
+        }
+    }
+    if (slots != 1) {
+        std::printf("    %zu slots hold one edge recorded by %d threads\n", slots, THREADS);
         return false;
     }
     return true;

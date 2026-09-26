@@ -15,6 +15,7 @@
 
 #include <string_view>
 #include <tuple>
+#include <utility>
 
 #include <cstdio>
 
@@ -995,6 +996,23 @@ auto tracking_disabled() -> bool {
     return untracked && g_report_count == 0 && g_trigger_count == 0;
 }
 
+// One more distinct class after a hub than the hub's set has slots for: the
+// last edge does not fit, and says so once.
+template <usize... Indices>
+auto fan_out(std::index_sequence<Indices...>) -> int {
+    fake::BareLock hub;
+    fake::BareLock leaf;
+    reset_reports();
+    hold_as<ClassOf<struct FanOutHub>>(hub, [&] {
+        (hold_as<lockdep::LockClass<struct FanOutLeaf, fake::BareLock, Indices>>(leaf, [] {}), ...);
+    });
+    return reports_of(lockdep::LockResult::MaxLockDependencies);
+}
+
+auto full_set_is_reported() -> bool {
+    return fan_out(std::make_index_sequence<lockdep::DEPENDENCY_SET_CAPACITY + 1>{}) == 1;
+}
+
 auto no_locks_held_is_asserted() -> bool {
     fake::BareLock a;
 
@@ -1084,6 +1102,7 @@ auto main() -> int {
         check("active_list_disabled", active_list_disabled());
         check("tracking_disabled", tracking_disabled());
         check("no_locks_held_is_asserted", no_locks_held_is_asserted());
+        check("full_set_is_reported", full_set_is_reported());
         check("states_follow_irq_safety", states_follow_irq_safety(a, bare));
         // Run last: it leaves a cycle in the graph on purpose.
         check("catches_direct_inversion", catches_direct_inversion());

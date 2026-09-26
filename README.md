@@ -141,8 +141,9 @@ state.
   bare lock -- every lock in the kernel today -- still falls back to
   `DefaultLockClass<Lock>`, shared by every lock of its type, so two different
   bare spinlocks still look like one class to the validator.
-- `LOCKDEP_MAX_DEPENDENCIES` (default 32) bounds the successors one class can
-  record. Overflow is reported and costs completeness, not soundness.
+- `LOCKDEP_MAX_DEPENDENCIES` (default 32, raised to the prime 97) bounds the
+  successors one class can record. Overflow is reported as
+  `MaxLockDependencies` and costs completeness, not soundness.
 - `ValidationOptions::IrqSafe`, `SingletonLock` and `ActiveListDisabled` are
   carried on the class but not yet acted on.
 - Only one detector pass may run at a time; the walk keeps its marks in the

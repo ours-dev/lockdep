@@ -483,8 +483,17 @@ iterative, with its scratch state in the nodes. It reports each cycle once,
 through `system_circular_lock_dependency_detected()`, naming the component's
 root as Zircon's detector does.
 
-Still to come: the dependency set as Zircon's lock-free open-addressed hash
-set (`lock_dependency_set.h`) instead of a linear array.
+The successors are Zircon's lock-free, wait-free hash set
+(`lock_dependency_set.h`): open addressing with linear probing over a fixed
+array whose slots only ever go from empty to full. A lookup stops at the first
+empty slot; an insertion claims one with a compare-exchange, so an edge
+recorded by several CPUs at once takes exactly one slot and is new for exactly
+one of them; the set is full only once every slot has been probed. The
+capacity is `LOCKDEP_MAX_DEPENDENCIES` raised to a prime from Zircon's table
+(32 becomes 97), because the hash is the class state's address and those are
+all aligned alike -- modulo a power of two they would crowd into a few slots.
+All of it is relaxed: the only thing published is the pointer, to a class
+state that is constant-initialised before anything runs.
 
 ## Environment — `runtime_api.hpp`
 
