@@ -46,7 +46,7 @@ file names, and `std::` facilities over ustl wrappers.
 | Header | Zircon counterpart | Holds |
 | --- | --- | --- |
 | `lockdep/config.hpp` | `common.h` | feature level, `LockClassId`, `LockResult`, limits |
-| `lockdep/lock_flags.hpp` | `lock_traits.h` | `LockFlags`, `lockdep_traits` lookup |
+| `lockdep/lock_traits.hpp` | `lock_traits.h` | `ValidationOptions`, `lockdep_traits` lookup |
 | `lockdep/lock_policy.hpp` | `lock_policy.h` | option tags, the `LockPolicy` concept, `lockdep_policy` lookup |
 | `lockdep/lock_class.hpp` | `lock_class.h` | `class_id<Tag>()`, `Lock<T>`, `SingletonLock` |
 | `lockdep/guard.hpp` | `guard.h` | `Guard`, `NullGuard`, `assert_held` |
@@ -89,10 +89,16 @@ auto to_string(LockResult) -> char const *;
 Same as Zircon except naming. Zircon's `DependencyExists` is an internal
 return value of the dependency set and stays internal here.
 
-## Lock flags — `lock_flags.hpp`
+## Validation options — `lock_traits.hpp`
+
+Zircon calls this set `LockFlags`. Here it is `ValidationOptions`: the bits
+tell the validator which rules to apply to a lock class, and this repository
+names a bitmask of that kind `*Options` (as with the scheduler's
+`EnqueueOptions`). It used to be `ValidationControl`, which named a controller
+rather than a set of options.
 
 ```cpp
-enum class LockFlags : u16 {
+enum class ValidationOptions : u16 {
     None = 0,
     IrqSafe            = 1 << 0,
     Nestable           = 1 << 1,
@@ -112,13 +118,13 @@ function declaration that ADL finds from inside lockdep:
 ```cpp
 namespace ours::sync {
     class SpinLock { ... };
-    auto lockdep_traits(SpinLock *) -> lockdep::Traits<lockdep::LockFlags::IrqSafe>;
+    auto lockdep_traits(SpinLock *) -> lockdep::Traits<lockdep::ValidationOptions::IrqSafe>;
 }
 ```
 
 Zircon wraps this in `LOCK_DEP_TRAITS()`. The macro hides nothing but a
 declaration the language already spells, so here it is written out. A type with
-no declaration gets `LockFlags::None`, as in Zircon.
+no declaration gets `ValidationOptions::None`, as in Zircon.
 
 `Traits<Flags>` rejects `MultiAcquire | Nestable` and
 `MultiAcquire | ReAcquireFatal` at compile time, like Zircon's
@@ -186,7 +192,7 @@ a static state object that exists once per instantiation, exactly like
 Zircon's `LockClassStateStorage::lock_class_state_`:
 
 ```cpp
-template <typename Tag, LockFlags Flags = LockFlags::None>
+template <typename Tag, ValidationOptions Flags = ValidationOptions::None>
 constexpr auto class_id() -> LockClassId;
 ```
 
@@ -238,7 +244,7 @@ How this differs from Zircon, and why:
 Global locks:
 
 ```cpp
-template <typename Tag, typename LockType, LockFlags Flags = LockFlags::None>
+template <typename Tag, typename LockType, ValidationOptions Flags = ValidationOptions::None>
 class SingletonLock {
   public:
     static auto get() -> Lock<LockType> &;
@@ -362,7 +368,7 @@ The held list becomes doubly linked (Zircon uses
 class LockClassState {
   public:
     static auto get(LockClassId) -> LockClassState *;
-    auto flags() const -> LockFlags;
+    auto flags() const -> ValidationOptions;
     auto name() const -> char const *;
     // Validation only:
     auto has_dependency(LockClassId) const -> bool;
@@ -387,7 +393,7 @@ Declared by lockdep, defined by the kernel; referenced only when validation is
 enabled.
 
 ```cpp
-auto system_get_thread_lock_state(LockFlags flags) -> ThreadLockState *;
+auto system_get_thread_lock_state(ValidationOptions flags) -> ThreadLockState *;
 auto system_init_thread_lock_state(ThreadLockState *) -> void;
 auto system_lock_validation_error(AcquiredLockEntry *bad, AcquiredLockEntry *conflicting,
                                   ThreadLockState *, void *caller, LockResult) -> void;
@@ -416,5 +422,5 @@ the acquire path.
 ## Layout
 
 Per this repository's library shape: `include/lockdep/`, `src/`, `test/`,
-`.gitignore`, `.clang-format`. Tests are built by GN rather than by the shell
-scripts currently in `tests/`.
+`.gitignore`, `.clang-format`. The tests are meant to be built by GN in the
+end; until lockdep has a GN test target, `test/run_tests.py` drives them.

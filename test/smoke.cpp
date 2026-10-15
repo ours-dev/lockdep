@@ -65,7 +65,7 @@ struct StrictLock {
 LOCKDEP_STATE_SAVER(StrictLock, lockdep::SavedStateOption::IrqSave, AutoInterruptDisabler);
 auto lockdep_option_required(StrictLock *) -> void;
 
-LOCK_DEP_TRAITS(SpinLock, lockdep::ValidationControl::IrqSafe);
+LOCK_DEP_TRAITS(SpinLock, lockdep::ValidationOptions::IrqSafe);
 LOCKDEP_STATE_SAVER(SpinLock, lockdep::SavedStateOption::IrqSave, AutoInterruptDisabler);
 LOCKDEP_STATE_SAVER(SpinLock, lockdep::SavedStateOption::PreemptDisable, AutoPreemptDisabler);
 // The combined option names its own saver, the way spin_lock.hpp does it.
@@ -86,13 +86,13 @@ struct NestableLock {
     auto acquire() -> void {}
     auto release() -> void {}
 };
-LOCK_DEP_TRAITS(NestableLock, lockdep::ValidationControl::Nestable);
+LOCK_DEP_TRAITS(NestableLock, lockdep::ValidationOptions::Nestable);
 
 struct LeafLock {
     auto acquire() -> void {}
     auto release() -> void {}
 };
-LOCK_DEP_TRAITS(LeafLock, lockdep::ValidationControl::Leaf);
+LOCK_DEP_TRAITS(LeafLock, lockdep::ValidationOptions::Leaf);
 
 } // namespace fake
 
@@ -141,9 +141,10 @@ auto report_violation(ViolationReport const &report) -> void {
 
 // --- traits ------------------------------------------------------------------
 
-static_assert(lockdep::LockControlV<fake::SpinLock> == lockdep::ValidationControl::IrqSafe,
+static_assert(lockdep::LockValidationOptionsV<fake::SpinLock> ==
+                  lockdep::ValidationOptions::IrqSafe,
               "declared traits must be picked up through ADL");
-static_assert(lockdep::LockControlV<fake::BareLock> == lockdep::ValidationControl::None,
+static_assert(lockdep::LockValidationOptionsV<fake::BareLock> == lockdep::ValidationOptions::None,
               "a lock with no LOCK_DEP_TRAITS must fall back to None");
 
 // --- state savers ------------------------------------------------------------
@@ -396,7 +397,7 @@ auto non_nestable_recursion_is_reported() -> bool {
     context->release(inner);
     context->release(outer);
 
-    return g_reacquire_reports == 1;
+    return g_reacquire_reports == 1 && g_last_violation == lockdep::Violation::ReAcquire;
 }
 
 auto leaf_must_be_last() -> bool {
@@ -413,7 +414,7 @@ auto leaf_must_be_last() -> bool {
     leaf.release();
     context->release(leaf_entry);
 
-    return g_leaf_reports == 1;
+    return g_leaf_reports == 1 && g_last_violation == lockdep::Violation::LeafAcquire;
 }
 
 // --- driver ------------------------------------------------------------------

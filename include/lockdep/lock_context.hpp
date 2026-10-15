@@ -23,6 +23,7 @@ namespace priv {
 
         explicit AcquiredLockEntry(LockClassId id) : m_id(id) {}
 
+        [[nodiscard]]
         auto id() const -> LockClassId {
             return m_id;
         }
@@ -62,6 +63,7 @@ namespace priv {
             static_cast<void>(m_acquired_locks.erase(m_acquired_locks.iterator_to(entry)));
         }
 
+        [[nodiscard]]
         auto empty() const -> bool {
             return m_acquired_locks.empty();
         }
@@ -100,7 +102,7 @@ namespace priv {
                 }
 
                 // A leaf lock is the last one a context may take.
-                if (held->has(ValidationControl::Leaf)) {
+                if (held->has(ValidationOptions::Leaf)) {
                     report(Violation::LeafAcquire, acquiring, held);
                 }
 
@@ -121,15 +123,15 @@ namespace priv {
 
         static auto report(Violation violation, ValidatorLockClassState *acquiring,
                            ValidatorLockClassState *held) -> void {
-            if (acquiring->has(ValidationControl::ReportingDisabled) ||
-                held->has(ValidationControl::ReportingDisabled)) {
+            if (acquiring->has(ValidationOptions::ReportingDisabled) ||
+                held->has(ValidationOptions::ReportingDisabled)) {
                 return;
             }
             report_violation(ViolationReport{
                 violation,
                 acquiring->id(),
                 held->id(),
-                acquiring->has(ValidationControl::ReAcquireFatal),
+                acquiring->has(ValidationOptions::ReAcquireFatal),
             });
         }
 
@@ -145,6 +147,7 @@ namespace priv {
 
         explicit NullAcquiredLockEntry(LockClassId) {}
 
+        [[nodiscard]]
         auto id() const -> LockClassId {
             return INVALID_LOCK_CLASS_ID;
         }
@@ -154,6 +157,7 @@ namespace priv {
       public:
         auto acquire(NullAcquiredLockEntry &) -> void {}
         auto release(NullAcquiredLockEntry &) -> void {}
+        [[nodiscard]]
         auto empty() const -> bool {
             return true;
         }

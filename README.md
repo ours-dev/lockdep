@@ -38,12 +38,12 @@ Guard<SpinLock, IrqSave> guard{lock};
 A lock type opts into traits and state savers next to its own declaration:
 
 ```cpp
-LOCK_DEP_TRAITS(MyLock, lockdep::ValidationControl::IrqSafe);
+LOCK_DEP_TRAITS(MyLock, lockdep::ValidationOptions::IrqSafe);
 LOCKDEP_STATE_SAVER(MyLock, lockdep::SavedStateOption::IrqSave,
                     arch::AutoInterruptDisabler);
 ```
 
-Traits are optional: a lock that declares none gets `ValidationControl::None`.
+Traits are optional: a lock that declares none gets `ValidationOptions::None`.
 A saver is not: asking a `Guard` for an option the lock declares no saver for
 does not compile, because the only other answer -- save nothing -- is the bug
 that left every `Guard<SpinLock, IrqSave>` running with interrupts enabled.
@@ -87,9 +87,9 @@ Two functions, referenced only when validation is enabled, so a build with
 ## Tests
 
 ```sh
-tests/run_tests.py                    # everything
-tests/run_tests.py --suite smoke      # logic, at all three feature levels
-tests/run_tests.py --suite threaded   # real threads, plain and under the sanitizers
+test/run_tests.py                    # everything
+test/run_tests.py --suite smoke      # logic, at all three feature levels
+test/run_tests.py --suite threaded   # real threads, plain and under the sanitizers
 ```
 
 The headers lean on the ours tree -- the force-included prelude for `usize`,
@@ -98,14 +98,14 @@ the ours checkout above this library, or takes one with `--ours`.
 
 Lock validation turns out to be well suited to a host test, because everything
 lockdep concludes is a property of a graph, and a graph does not care whether
-the locks that built it were spinlocks or `std::mutex`. `tests/smoke.cpp` covers
+the locks that built it were spinlocks or `std::mutex`. `test/smoke.cpp` covers
 that logic at every feature level with `-Wall -Wextra -Werror`, using fake locks:
 that a consistent order stays clean, that an inversion is caught at acquire time,
 that a three-node cycle is invisible to the acquire path but found by the
 detector, that repeated passes agree, and that a guard costs nothing extra when
 validation is compiled out.
 
-`tests/threaded.cpp` drives it the way a kernel does — one `LockContext` per
+`test/threaded.cpp` drives it the way a kernel does — one `LockContext` per
 thread, real locks, several threads recording into the shared graph at once —
 and checks that two threads taking the same pair of locks in opposite orders are
 reported even though the run never actually deadlocks. Its ThreadSanitizer
@@ -126,7 +126,7 @@ state.
   validator. The lookup is behind `DefaultLockClass` so that change stays local.
 - `LOCKDEP_MAX_DEPENDENCIES` (default 32) bounds the successors one class can
   record. Overflow is reported and costs completeness, not soundness.
-- `ValidationControl::IrqSafe`, `SingletonLock` and `ActiveListDisabled` are
+- `ValidationOptions::IrqSafe`, `SingletonLock` and `ActiveListDisabled` are
   carried on the class but not yet acted on.
 - Only one detector pass may run at a time; the walk keeps its marks in the
   graph nodes.

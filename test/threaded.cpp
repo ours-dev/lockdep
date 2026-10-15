@@ -24,19 +24,27 @@
 
 #include <cstdio>
 
+#include <ours/compiler.hpp>
+
 static_assert(lockdep::LOCK_VALIDATION_ENABLED,
               "this test only means anything with validation compiled in");
 
 namespace {
 
-// A real lock, shaped the way lockdep expects a lock to be shaped.
-class Mutex {
+// A real lock, shaped the way lockdep expects a lock to be shaped -- including
+// its thread-safety annotations, since the suite is built with the kernel's
+// -Wthread-safety. The capability is this object; the std::mutex inside is an
+// implementation detail the analysis is kept out of, the same split a kernel
+// lock makes between its annotated interface and its body.
+class TA_CAPABILITY("mutex") Mutex {
   public:
-    auto acquire() -> void {
+    TA_ACQUIRE()
+    TA_NO_THREAD_SAFETY_ANALYSIS auto acquire() -> void {
         m_mutex.lock();
     }
 
-    auto release() -> void {
+    TA_RELEASE()
+    TA_NO_THREAD_SAFETY_ANALYSIS auto release() -> void {
         m_mutex.unlock();
     }
 
@@ -148,17 +156,17 @@ auto catches_abba_across_threads() -> bool {
 // parts that are actually shared: the registry push and the append to the
 // dependency set.  Run it under -fsanitize=thread to get the real verdict.
 auto survives_concurrent_recording() -> bool {
-    constexpr int kThreads = 8;
-    constexpr int kRounds = 2000;
+    constexpr int THREADS = 8;
+    constexpr int ROUNDS = 2000;
 
     Mutex outer;
     Mutex inner;
 
     std::vector<std::thread> threads;
-    threads.reserve(kThreads);
-    for (int i = 0; i < kThreads; ++i) {
+    threads.reserve(THREADS);
+    for (int i = 0; i < THREADS; ++i) {
         threads.emplace_back([&] {
-            for (int round = 0; round < kRounds; ++round) {
+            for (int round = 0; round < ROUNDS; ++round) {
                 hold<OwnerStress>(outer, [&] { hold<OwnerC>(inner, [] {}); });
             }
         });
@@ -181,8 +189,8 @@ auto survives_concurrent_recording() -> bool {
 
     // A racing duplicate costs a slot but must not multiply without bound.
     auto const count = stress->dependency_count();
-    if (count > kThreads) {
-        std::printf("    %zu slots used for one edge under %d threads\n", count, kThreads);
+    if (count > THREADS) {
+        std::printf("    %zu slots used for one edge under %d threads\n", count, THREADS);
         return false;
     }
     return true;
